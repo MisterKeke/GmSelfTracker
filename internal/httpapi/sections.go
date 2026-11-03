@@ -114,6 +114,10 @@ func (a *API) createSection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !a.validIcon(r, input.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
+	}
 	var order int
 	if err := a.db.QueryRowContext(r.Context(), `SELECT COALESCE(MAX(sort_order)+1,0) FROM sections WHERE game_id=? AND parent_id IS ?`, gameID, nullableString(input.ParentID)).Scan(&order); err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not create section.")
@@ -159,6 +163,10 @@ func (a *API) updateSection(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Icon != nil {
 		item.Icon = *input.Icon
+	}
+	if !a.validIcon(r, item.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
 	}
 	if input.SortOrder != nil {
 		item.SortOrder = *input.SortOrder
@@ -242,7 +250,7 @@ func (a *API) listPlacements(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Section")
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.archived,o.updated_at FROM section_placements p JOIN objects o ON o.id=p.object_id JOIN object_types t ON t.id=o.object_type_id WHERE p.section_id=? AND o.archived=0 ORDER BY o.name`, sectionID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.archived,o.updated_at FROM section_placements p JOIN objects o ON o.id=p.object_id JOIN object_types t ON t.id=o.object_type_id WHERE p.section_id=? AND o.archived=0 AND t.archived=0 ORDER BY o.name`, sectionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load section objects.")
 		return
@@ -274,7 +282,7 @@ func (a *API) addPlacement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var exists int
-	err = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM objects o JOIN games g ON g.id=o.game_id WHERE o.id=? AND o.game_id=? AND g.user_id=? AND o.archived=0`, input.ObjectID, sec.GameID, a.currentUser(r).ID).Scan(&exists)
+	err = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM objects o JOIN games g ON g.id=o.game_id JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND g.user_id=? AND o.archived=0 AND t.archived=0`, input.ObjectID, sec.GameID, a.currentUser(r).ID).Scan(&exists)
 	if err != nil || exists == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_object", "Choose an active object from this game.")
 		return
@@ -328,9 +336,15 @@ func validDisplayStyle(value string) bool {
 
 func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, raw json.RawMessage) error {
 	var config struct {
-		VisibleFieldIDs []string `json:"visible_field_ids"`
-		ChecklistField  string   `json:"checklist_field_id"`
-		ProgressField   string   `json:"progress_field_id"`
+		VisibleFieldIDs    []string `json:"visible_field_ids"`
+		ChecklistField     string   `json:"checklist_field_id"`
+		ProgressField      string   `json:"progress_field_id"`
+		ProgressMode       string   `json:"progress_mode"`
+		CurrentFields      []string `json:"progress_current_field_ids"`
+		MaximumFields      []string `json:"progress_max_field_ids"`
+		Maximum            float64  `json:"progress_maximum"`
+		RelationshipField  string   `json:"progress_relationship_field_id"`
+		ChildProgressField string   `json:"progress_child_field_id"`
 	}
 	if len(raw) == 0 {
 		return nil
@@ -361,6 +375,46 @@ func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, r
 		fieldType, err := a.sectionFieldType(ctx, gameID, config.ProgressField)
 		if err != nil || fieldType != "progress" {
 			return errors.New("The progress view field must be an active progress field from this game.")
+		}
+	}
+	if config.ProgressMode != "" && config.ProgressMode != "field" && config.ProgressMode != "calculated" && config.ProgressMode != "children" {
+		return errors.New("Choose a supported progress mode.")
+	}
+	if config.ProgressMode == "calculated" {
+		if len(config.CurrentFields) == 0 || len(config.CurrentFields) > 20 || len(config.MaximumFields) > 20 {
+			return errors.New("Choose 1–20 current fields and up to 20 maximum fields.")
+		}
+		if len(config.MaximumFields) == 0 && config.Maximum <= 0 {
+			return errors.New("Enter a positive maximum or choose maximum fields.")
+		}
+		typeID := ""
+		seen := map[string]bool{}
+		for _, id := range append(append([]string{}, config.CurrentFields...), config.MaximumFields...) {
+			var kind, ownerType string
+			err := a.db.QueryRowContext(ctx, `SELECT f.field_type,f.object_type_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND t.game_id=? AND f.archived=0 AND t.archived=0`, id, gameID).Scan(&kind, &ownerType)
+			if err != nil || (kind != "integer" && kind != "decimal" && kind != "percentage" && kind != "formula") {
+				return errors.New("Calculated progress needs active numeric fields.")
+			}
+			if typeID != "" && ownerType != typeID {
+				return errors.New("Calculated progress fields must belong to the same object type.")
+			}
+			if seen[id] {
+				return errors.New("Choose each progress field only once.")
+			}
+			seen[id], typeID = true, ownerType
+		}
+	}
+	if config.ProgressMode == "children" {
+		var typeID string
+		if err := a.db.QueryRowContext(ctx, `SELECT f.object_type_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND t.game_id=? AND f.archived=0 AND t.archived=0`, config.RelationshipField, gameID).Scan(&typeID); err != nil {
+			return errors.New("Choose a relationship field from this game.")
+		}
+		if err := a.validateAggregation(ctx, typeID, relationshipAggregation{RelationshipFieldID: config.RelationshipField, FieldID: config.ChildProgressField, Operation: "sum"}); err != nil {
+			return err
+		}
+		kind, err := a.sectionFieldType(ctx, gameID, config.ChildProgressField)
+		if err != nil || kind != "progress" {
+			return errors.New("Child progress must use a current/maximum progress field.")
 		}
 	}
 	return nil

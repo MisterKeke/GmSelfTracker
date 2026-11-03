@@ -19,8 +19,17 @@ var migrationFS embed.FS
 
 func Open(ctx context.Context, path string) (*sql.DB, error) {
 	if path != ":memory:" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, fmt.Errorf("create database directory: %w", err)
+		}
+		// SQLite otherwise creates files using the process umask. New databases
+		// contain password hashes and private notes, so create them owner-only.
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create database file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("close database file: %w", err)
 		}
 	}
 	dsn := path

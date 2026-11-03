@@ -18,11 +18,13 @@ import (
 )
 
 type API struct {
-	db        *sql.DB
-	uploadDir string
-	secure    bool
-	logger    *slog.Logger
-	limiter   *loginLimiter
+	db          *sql.DB
+	uploadDir   string
+	secure      bool
+	logger      *slog.Logger
+	limiter     *loginLimiter
+	authSlots   chan struct{}
+	uploadSlots chan struct{}
 }
 
 type userSession struct {
@@ -39,12 +41,12 @@ func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) htt
 	if logger == nil {
 		logger = slog.Default()
 	}
-	a := &API{db: db, uploadDir: uploadDir, secure: production, logger: logger, limiter: newLoginLimiter()}
+	a := &API{db: db, uploadDir: uploadDir, secure: production, logger: logger, limiter: newLoginLimiter(), authSlots: make(chan struct{}, 4), uploadSlots: make(chan struct{}, 2)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.health)
-	mux.HandleFunc("POST /api/auth/register", a.register)
-	mux.HandleFunc("POST /api/auth/login", a.login)
-	mux.Handle("POST /api/auth/password", a.protected(http.HandlerFunc(a.changePassword)))
+	mux.HandleFunc("POST /api/auth/register", a.limitAuthentication(a.register))
+	mux.HandleFunc("POST /api/auth/login", a.limitAuthentication(a.login))
+	mux.Handle("POST /api/auth/password", a.protected(http.HandlerFunc(a.limitAuthentication(a.changePassword))))
 	mux.Handle("POST /api/auth/logout", a.protected(http.HandlerFunc(a.logout)))
 	mux.Handle("GET /api/auth/me", a.protected(http.HandlerFunc(a.me)))
 
@@ -74,6 +76,10 @@ func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) htt
 
 	protected("GET /api/object-types/{typeID}", a.getObjectType)
 	protected("PATCH /api/object-types/{typeID}", a.updateObjectType)
+	protected("POST /api/object-types/{typeID}/archive", a.archiveObjectType)
+	protected("POST /api/object-types/{typeID}/restore", a.restoreObjectType)
+	protected("POST /api/sections/{sectionID}/goals", a.addGoalPlacement)
+	protected("DELETE /api/sections/{sectionID}/goals/{goalID}", a.removeGoalPlacement)
 	protected("POST /api/object-types/{typeID}/fields", a.createField)
 	protected("PATCH /api/fields/{fieldID}", a.updateField)
 	protected("POST /api/fields/{fieldID}/archive", a.archiveField)
@@ -93,12 +99,14 @@ func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) htt
 	protected("DELETE /api/goal-tasks/{taskID}", a.deleteGoalTask)
 
 	protected("POST /api/assets", a.uploadAsset)
+	protected("GET /api/assets", a.listAssets)
 	protected("GET /api/assets/{assetID}", a.getAsset)
+	protected("DELETE /api/assets/{assetID}", a.deleteAsset)
 
 	// Static HTML, CSS, and modules are embedded so the server works from any current directory.
 	static, _ := web.Files()
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	return requestLogger(logger, mux)
+	return a.security(requestLogger(logger, mux))
 }
 
 func (a *API) protected(next http.Handler) http.Handler {
@@ -152,8 +160,22 @@ func (a *API) newSession(ctx context.Context, userID string) (userSession, strin
 	if err := a.db.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ?`, userID).Scan(&user.Username); err != nil {
 		return userSession{}, "", err
 	}
-	_, err = a.db.ExecContext(ctx, `INSERT INTO sessions(token_hash, csrf_token, user_id, expires_at, created_at) VALUES(?,?,?,?,?)`, tokenHash(token), csrf, userID, time.Now().UTC().Add(30*24*time.Hour).Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
+		return userSession{}, "", err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at<=?`, now); err != nil {
+		return userSession{}, "", err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=? ORDER BY created_at DESC,token_hash LIMIT 19)`, userID, userID); err != nil {
+		return userSession{}, "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at) VALUES(?,?,?,?,?)`, tokenHash(token), csrf, userID, time.Now().UTC().Add(30*24*time.Hour).Format(time.RFC3339), now); err != nil {
+		return userSession{}, "", err
+	}
+	if err := tx.Commit(); err != nil {
 		return userSession{}, "", err
 	}
 	return user, token, nil
@@ -204,6 +226,9 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	if !requireJSON(w, r) {
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()

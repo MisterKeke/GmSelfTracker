@@ -4,6 +4,7 @@ package formula
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -15,6 +16,9 @@ type parser struct {
 }
 
 func Evaluate(expression string, values map[string]float64) (float64, error) {
+	if len(expression) > 4096 {
+		return 0, fmt.Errorf("formula exceeds 4096 bytes")
+	}
 	p := &parser{input: expression, values: values}
 	value, err := p.expression()
 	if err != nil {
@@ -23,6 +27,9 @@ func Evaluate(expression string, values map[string]float64) (float64, error) {
 	p.space()
 	if p.pos != len(p.input) {
 		return 0, fmt.Errorf("unexpected character at position %d", p.pos+1)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("formula result is not finite")
 	}
 	return value, nil
 }

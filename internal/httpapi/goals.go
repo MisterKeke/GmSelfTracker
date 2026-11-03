@@ -12,6 +12,7 @@ import (
 )
 
 type goal struct {
+	SectionIDs  []string        `json:"section_ids"`
 	ID          string          `json:"id"`
 	GameID      string          `json:"game_id"`
 	Title       string          `json:"title"`
@@ -78,6 +79,11 @@ func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i := range items {
+		items[i].SectionIDs, err = a.goalSections(r, items[i].ID)
+		if err != nil {
+			writeError(w, 500, "database_error", "Could not load goal sections.")
+			return
+		}
 		if err := a.populateGoalProgress(r.Context(), &items[i]); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not calculate goal progress.")
 			return
@@ -101,6 +107,8 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		Target      json.RawMessage `json:"target"`
 		Current     float64         `json:"current"`
 		Tasks       []string        `json:"tasks"`
+		Conditions  []goalCondition `json:"conditions"`
+		Mode        string          `json:"mode"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -114,13 +122,46 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_goal_type", "Choose manual, checklist, field target, or numeric progress.")
 		return
 	}
-	if input.GoalType == "field_target" {
+	if len(input.Conditions) > 0 {
+		if input.GoalType != "field_target" {
+			writeError(w, 400, "invalid_goal", "Conditions require a field target goal.")
+			return
+		}
+		if input.Mode == "" {
+			input.Mode = "all"
+		}
+		rule := goalRule{Mode: input.Mode, Conditions: input.Conditions}
+		if err := a.validateGoalRule(r.Context(), gameID, rule); err != nil {
+			writeError(w, 400, "invalid_goal", err.Error())
+			return
+		}
+		input.Target, _ = json.Marshal(rule)
+		input.ObjectID, input.FieldID = nil, nil
+	}
+	if input.GoalType != "field_target" {
+		input.ObjectID, input.FieldID = nil, nil
+	}
+	if input.GoalType != "checklist" {
+		input.Tasks = nil
+	}
+	if len(input.Tasks) > 200 {
+		writeError(w, 400, "invalid_tasks", "Use no more than 200 tasks.")
+		return
+	}
+	for i, title := range input.Tasks {
+		input.Tasks[i] = strings.TrimSpace(title)
+		if input.Tasks[i] == "" || len(input.Tasks[i]) > 160 {
+			writeError(w, 400, "invalid_tasks", "Task titles must contain 1–160 characters.")
+			return
+		}
+	}
+	if input.GoalType == "field_target" && len(input.Conditions) == 0 {
 		if input.ObjectID == nil || input.FieldID == nil || len(input.Target) == 0 {
 			writeError(w, http.StatusBadRequest, "invalid_goal", "Field target goals need an object, a numeric field, and a target.")
 			return
 		}
 		var fieldType, objectType, objectGame string
-		err := a.db.QueryRowContext(r.Context(), `SELECT f.field_type,o.object_type_id,o.game_id FROM field_definitions f JOIN objects o ON o.id=? JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND t.game_id=o.game_id`, *input.ObjectID, *input.FieldID).Scan(&fieldType, &objectType, &objectGame)
+		err := a.db.QueryRowContext(r.Context(), `SELECT f.field_type,o.object_type_id,o.game_id FROM field_definitions f JOIN objects o ON o.id=? JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND f.object_type_id=o.object_type_id AND t.game_id=o.game_id AND f.archived=0 AND o.archived=0 AND t.archived=0`, *input.ObjectID, *input.FieldID).Scan(&fieldType, &objectType, &objectGame)
 		if err != nil || objectGame != gameID || !(fieldType == "integer" || fieldType == "decimal" || fieldType == "percentage" || fieldType == "progress" || fieldType == "formula") {
 			writeError(w, http.StatusBadRequest, "invalid_goal_field", "Choose a numeric field on an object in this game.")
 			return
@@ -421,11 +462,15 @@ func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
 			item.Completed = done == len(item.Tasks)
 		}
 	case "field_target":
+		var rule goalRule
+		if json.Unmarshal(item.Target, &rule) == nil && len(rule.Conditions) > 0 {
+			return a.populateRuleProgress(ctx, item, rule)
+		}
 		if item.ObjectID == nil || item.FieldID == nil {
 			return nil
 		}
 		var record objectRecord
-		err := a.db.QueryRowContext(ctx, `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=?`, *item.ObjectID).Scan(&record.ID, &record.Name, &record.ObjectTypeID, &record.TypeName, &record.Description, &record.Image, &record.UpdatedAt, &record.GameID)
+		err := a.db.QueryRowContext(ctx, `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, *item.ObjectID, item.GameID).Scan(&record.ID, &record.Name, &record.ObjectTypeID, &record.TypeName, &record.Description, &record.Image, &record.UpdatedAt, &record.GameID)
 		if err == sql.ErrNoRows {
 			return nil
 		}
@@ -458,8 +503,13 @@ func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
 			target, _ := numberFromJSON(item.Target)
 			item.Current = current
 			if target > 0 {
-				item.Progress = math.Min(100, current/target*100)
+				item.Progress = math.Max(0, math.Min(100, current/target*100))
 				item.Completed = current >= target
+			} else {
+				item.Completed = current >= target
+				if item.Completed {
+					item.Progress = 100
+				}
 			}
 		}
 	}
@@ -467,11 +517,19 @@ func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
 }
 
 func numberFromJSON(raw []byte) (float64, error) {
-	var n json.Number
+	var value any
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()
-	if err := decoder.Decode(&n); err != nil {
+	if err := decoder.Decode(&value); err != nil {
 		return 0, err
 	}
-	return strconv.ParseFloat(string(n), 64)
+	n, ok := value.(json.Number)
+	if !ok {
+		return 0, errText("Enter a number.")
+	}
+	number, err := strconv.ParseFloat(string(n), 64)
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, errText("Enter a finite number.")
+	}
+	return number, nil
 }

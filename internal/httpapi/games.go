@@ -9,6 +9,7 @@ import (
 )
 
 type game struct {
+	Icon          string `json:"icon"`
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	Description   string `json:"description"`
@@ -26,14 +27,14 @@ func (a *API) listGames(w http.ResponseWriter, r *http.Request) {
 	includeArchived := r.URL.Query().Get("archived") == "true"
 	limit := queryInt(r, "limit", 100, 1, 200)
 	offset := queryInt(r, "offset", 0, 0, 1000000)
-	query := `SELECT g.id,g.name,g.description,g.cover_image,g.personal_notes,g.archived,g.created_at,g.updated_at,
-		(SELECT COUNT(*) FROM objects o WHERE o.game_id=g.id AND o.archived=0),
+	query := `SELECT g.icon,g.id,g.name,g.description,g.cover_image,g.personal_notes,g.archived,g.created_at,g.updated_at,
+		(SELECT COUNT(*) FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=g.id AND o.archived=0 AND t.archived=0),
 		(SELECT COUNT(*) FROM sections s WHERE s.game_id=g.id AND s.archived=0)
 		FROM games g WHERE g.user_id=?`
 	if !includeArchived {
 		query += ` AND g.archived=0`
 	}
-	query += ` ORDER BY g.updated_at DESC LIMIT ? OFFSET ?`
+	query += ` ORDER BY g.updated_at DESC,g.id LIMIT ? OFFSET ?`
 	rows, err := a.db.QueryContext(r.Context(), query, user.ID, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load your games.")
@@ -44,7 +45,7 @@ func (a *API) listGames(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var item game
 		var archived int
-		if err := rows.Scan(&item.ID, &item.Name, &item.Description, &item.CoverImage, &item.PersonalNotes, &archived, &item.CreatedAt, &item.UpdatedAt, &item.ObjectCount, &item.SectionCount); err != nil {
+		if err := rows.Scan(&item.Icon, &item.ID, &item.Name, &item.Description, &item.CoverImage, &item.PersonalNotes, &archived, &item.CreatedAt, &item.UpdatedAt, &item.ObjectCount, &item.SectionCount); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load your games.")
 			return
 		}
@@ -56,6 +57,7 @@ func (a *API) listGames(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createGame(w http.ResponseWriter, r *http.Request) {
 	var input struct {
+		Icon          string `json:"icon"`
 		Name          string `json:"name"`
 		Description   string `json:"description"`
 		CoverImage    string `json:"cover_image"`
@@ -69,6 +71,17 @@ func (a *API) createGame(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name", "Game name must be between 1 and 120 characters.")
 		return
 	}
+	if !a.validateImage(r, input.CoverImage) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
+	if input.Icon == "" {
+		input.Icon = "🎮"
+	}
+	if !a.validIcon(r, input.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
+	}
 	id, err := randomID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create the game.")
@@ -76,12 +89,12 @@ func (a *API) createGame(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	user := a.currentUser(r)
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO games(id,user_id,name,description,cover_image,personal_notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, user.ID, input.Name, input.Description, input.CoverImage, input.PersonalNotes, now, now)
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO games(icon,id,user_id,name,description,cover_image,personal_notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, input.Icon, id, user.ID, input.Name, input.Description, input.CoverImage, input.PersonalNotes, now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create the game.")
 		return
 	}
-	writeJSON(w, http.StatusCreated, game{ID: id, Name: input.Name, Description: input.Description, CoverImage: input.CoverImage, PersonalNotes: input.PersonalNotes, CreatedAt: now, UpdatedAt: now})
+	writeJSON(w, http.StatusCreated, game{Icon: input.Icon, ID: id, Name: input.Name, Description: input.Description, CoverImage: input.CoverImage, PersonalNotes: input.PersonalNotes, CreatedAt: now, UpdatedAt: now})
 }
 
 func (a *API) getGame(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +108,7 @@ func (a *API) getGame(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) updateGame(w http.ResponseWriter, r *http.Request) {
 	var input struct {
+		Icon          *string `json:"icon"`
 		Name          *string `json:"name"`
 		Description   *string `json:"description"`
 		CoverImage    *string `json:"cover_image"`
@@ -125,8 +139,19 @@ func (a *API) updateGame(w http.ResponseWriter, r *http.Request) {
 	if input.PersonalNotes != nil {
 		item.PersonalNotes = *input.PersonalNotes
 	}
+	if !a.validateImage(r, item.CoverImage) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
+	if input.Icon != nil {
+		item.Icon = *input.Icon
+	}
+	if !a.validIcon(r, item.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
+	}
 	item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	_, err = a.db.ExecContext(r.Context(), `UPDATE games SET name=?,description=?,cover_image=?,personal_notes=?,updated_at=? WHERE id=? AND user_id=?`, item.Name, item.Description, item.CoverImage, item.PersonalNotes, item.UpdatedAt, item.ID, a.currentUser(r).ID)
+	_, err = a.db.ExecContext(r.Context(), `UPDATE games SET icon=?,name=?,description=?,cover_image=?,personal_notes=?,updated_at=? WHERE id=? AND user_id=?`, item.Icon, item.Name, item.Description, item.CoverImage, item.PersonalNotes, item.UpdatedAt, item.ID, a.currentUser(r).ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not save game changes.")
 		return
@@ -169,11 +194,11 @@ func (a *API) loadGame(r *http.Request, id string, includeArchived bool) (game, 
 	user := a.currentUser(r)
 	var item game
 	var archived int
-	query := `SELECT id,name,description,cover_image,personal_notes,archived,created_at,updated_at FROM games WHERE id=? AND user_id=?`
+	query := `SELECT icon,id,name,description,cover_image,personal_notes,archived,created_at,updated_at FROM games WHERE id=? AND user_id=?`
 	if !includeArchived {
 		query += ` AND archived=0`
 	}
-	err := a.db.QueryRowContext(r.Context(), query, id, user.ID).Scan(&item.ID, &item.Name, &item.Description, &item.CoverImage, &item.PersonalNotes, &archived, &item.CreatedAt, &item.UpdatedAt)
+	err := a.db.QueryRowContext(r.Context(), query, id, user.ID).Scan(&item.Icon, &item.ID, &item.Name, &item.Description, &item.CoverImage, &item.PersonalNotes, &archived, &item.CreatedAt, &item.UpdatedAt)
 	item.Archived = archived != 0
 	return item, err
 }

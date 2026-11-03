@@ -30,7 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
-	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+	if err := os.MkdirAll(uploadDir, 0o700); err != nil {
 		logger.Error("upload directory startup failed", "error", err)
 		os.Exit(1)
 	}
@@ -40,6 +40,9 @@ func main() {
 		Handler:           httpapi.New(db, uploadDir, production, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	stopped := make(chan os.Signal, 1)
 	signal.Notify(stopped, os.Interrupt, syscall.SIGTERM)

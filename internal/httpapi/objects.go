@@ -52,14 +52,14 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 	includeArchived := r.URL.Query().Get("archived") == "true"
 	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=?`
 	if !includeArchived {
-		query += ` AND o.archived=0`
+		query += ` AND o.archived=0 AND t.archived=0`
 	}
 	args := []any{gameID}
 	if typeID := r.URL.Query().Get("type_id"); typeID != "" {
 		query += ` AND o.object_type_id=?`
 		args = append(args, typeID)
 	}
-	query += ` ORDER BY o.updated_at DESC LIMIT ? OFFSET ?`
+	query += ` ORDER BY o.updated_at DESC,o.id LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 	rows, err := a.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
@@ -130,8 +130,12 @@ func (a *API) createObject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name", "Object name must be between 1 and 160 characters.")
 		return
 	}
+	if !a.validateImage(r, input.Image) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
 	var typeExists int
-	if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM object_types WHERE id=? AND game_id=?`, input.ObjectTypeID, gameID).Scan(&typeExists); err != nil || typeExists == 0 {
+	if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM object_types WHERE id=? AND game_id=? AND archived=0`, input.ObjectTypeID, gameID).Scan(&typeExists); err != nil || typeExists == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_type", "Choose an object type from this game.")
 		return
 	}
@@ -240,6 +244,10 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 		item.Image = *input.Image
 	}
 	item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if !a.validateImage(r, item.Image) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
 	_, err = a.db.ExecContext(r.Context(), `UPDATE objects SET name=?,description=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Image, item.UpdatedAt, item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
@@ -343,7 +351,7 @@ func (a *API) deleteObject(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) loadObject(r *http.Request, id string) (objectRecord, error) {
 	var item objectRecord
-	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND o.archived=0 AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.GameID)
+	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND o.archived=0 AND t.archived=0 AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.GameID)
 	return item, err
 }
 
@@ -381,7 +389,7 @@ func (a *API) saveValues(ctx context.Context, db dbExecutor, gameID, objectID, t
 			for _, ref := range refs {
 				var targetType string
 				var archived int
-				if err := db.QueryRowContext(ctx, `SELECT object_type_id,archived FROM objects WHERE id=? AND game_id=?`, ref, gameID).Scan(&targetType, &archived); err != nil || archived != 0 {
+				if err := db.QueryRowContext(ctx, `SELECT o.object_type_id,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND t.archived=0`, ref, gameID).Scan(&targetType, &archived); err != nil || archived != 0 {
 					return validationError{code: "invalid_reference", message: "References must point to active objects in the same game."}
 				}
 				var options map[string]any
@@ -592,13 +600,13 @@ func (a *API) objectValues(ctx context.Context, db dbExecutor, item objectRecord
 			values[field.ID] = append(json.RawMessage(nil), field.DefaultValue...)
 		}
 	}
-	if err := a.calculateFormulas(ctx, db, item.ObjectTypeID, fields, values); err != nil {
+	if err := a.calculateFormulas(ctx, db, item, fields, values); err != nil {
 		return nil, err
 	}
 	return values, nil
 }
 
-func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, typeID string, fields []fieldDefinition, values map[string]json.RawMessage) error {
+func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, item objectRecord, fields []fieldDefinition, values map[string]json.RawMessage) error {
 	fieldMap := map[string]fieldDefinition{}
 	for _, field := range fields {
 		fieldMap[field.ID] = field
@@ -633,12 +641,16 @@ func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, typeID strin
 		if !ok || field.FieldType != "formula" || done[id] {
 			return nil
 		}
+		if len(visiting) > 128 {
+			return fmt.Errorf("formula dependency limit exceeded")
+		}
 		if visiting[id] {
 			return fmt.Errorf("circular formula dependency")
 		}
 		visiting[id] = true
 		var cfg struct {
-			Expression string `json:"expression"`
+			Expression  string                   `json:"expression"`
+			Aggregation *relationshipAggregation `json:"aggregation"`
 		}
 		if err := json.Unmarshal(field.Options, &cfg); err != nil {
 			return err
@@ -650,7 +662,19 @@ func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, typeID strin
 				}
 			}
 		}
-		result, err := formula.Evaluate(cfg.Expression, numeric)
+		inputs := make(map[string]float64, len(numeric)+1)
+		for key, value := range numeric {
+			inputs[key] = value
+		}
+		if cfg.Aggregation != nil {
+			aggregated, err := a.relationshipAggregate(ctx, db, item, *cfg.Aggregation)
+			if err != nil {
+				delete(visiting, id)
+				return nil
+			}
+			inputs["related"] = aggregated
+		}
+		result, err := formula.Evaluate(cfg.Expression, inputs)
 		if err != nil {
 			delete(visiting, id)
 			return nil
@@ -695,6 +719,16 @@ func formulaErrors(fields []fieldDefinition, values map[string]json.RawMessage) 
 		visiting[id] = true
 		defer delete(visiting, id)
 		if field.FieldType == "formula" {
+			if raw, exists := values[id]; exists {
+				if number, err := numericValue(raw); err == nil {
+					memo[id] = number
+					done[id] = true
+					return number, nil
+				}
+			}
+			if len(visiting) > 128 {
+				return 0, fmt.Errorf("formula dependency limit exceeded")
+			}
 			var config struct {
 				Expression string `json:"expression"`
 			}

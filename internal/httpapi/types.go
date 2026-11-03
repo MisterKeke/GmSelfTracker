@@ -29,6 +29,7 @@ type fieldDefinition struct {
 }
 
 type objectType struct {
+	Archived    bool              `json:"archived"`
 	ID          string            `json:"id"`
 	GameID      string            `json:"game_id"`
 	Name        string            `json:"name"`
@@ -56,7 +57,7 @@ func (a *API) listObjectTypes(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Game")
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,game_id,name,description,icon,image,sort_order FROM object_types WHERE game_id=? ORDER BY sort_order,name`, gameID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,game_id,name,description,icon,image,sort_order,archived FROM object_types WHERE game_id=? AND (archived=0 OR ?=1) ORDER BY sort_order,name`, gameID, boolInt(r.URL.Query().Get("archived") == "true"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load object types.")
 		return
@@ -65,7 +66,7 @@ func (a *API) listObjectTypes(w http.ResponseWriter, r *http.Request) {
 	items := make([]objectType, 0)
 	for rows.Next() {
 		var item objectType
-		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder); err != nil {
+		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load object types.")
 			return
 		}
@@ -111,6 +112,14 @@ func (a *API) createObjectType(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Icon == "" {
 		input.Icon = "◈"
+	}
+	if !a.validateImage(r, input.Image) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
+	if !a.validIcon(r, input.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
 	}
 	var order int
 	if err := a.db.QueryRowContext(r.Context(), `SELECT COALESCE(MAX(sort_order)+1,0) FROM object_types WHERE game_id=?`, gameID).Scan(&order); err != nil {
@@ -177,6 +186,14 @@ func (a *API) updateObjectType(w http.ResponseWriter, r *http.Request) {
 	if input.Image != nil {
 		item.Image = *input.Image
 	}
+	if !a.validateImage(r, item.Image) {
+		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
+		return
+	}
+	if !a.validIcon(r, item.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
+	}
 	_, err = a.db.ExecContext(r.Context(), `UPDATE object_types SET name=?,description=?,icon=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Icon, item.Image, time.Now().UTC().Format(time.RFC3339), item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object type.")
@@ -236,6 +253,10 @@ func (a *API) createField(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_default", err.Error())
 			return
 		}
+	}
+	if !a.validIcon(r, input.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
 	}
 	var order int
 	if err := a.db.QueryRowContext(r.Context(), `SELECT COALESCE(MAX(sort_order)+1,0) FROM field_definitions WHERE object_type_id=?`, typeID).Scan(&order); err != nil {
@@ -344,6 +365,10 @@ func (a *API) updateField(w http.ResponseWriter, r *http.Request) {
 			item.DefaultValue = defaultValue
 		}
 	}
+	if !a.validIcon(r, item.Icon) {
+		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
+		return
+	}
 	_, err = a.db.ExecContext(r.Context(), `UPDATE field_definitions SET name=?,icon=?,description=?,default_json=?,options_json=?,sort_order=?,updated_at=? WHERE id=?`, item.Name, item.Icon, item.Description, nullableJSON(item.DefaultValue), string(item.Options), item.SortOrder, time.Now().UTC().Format(time.RFC3339), item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update field definition.")
@@ -381,7 +406,7 @@ func (a *API) setFieldArchived(w http.ResponseWriter, r *http.Request, archived 
 
 func (a *API) loadObjectType(r *http.Request, id string) (objectType, error) {
 	var item objectType
-	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image,t.sort_order FROM object_types t JOIN games g ON g.id=t.game_id WHERE t.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder)
+	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image,t.sort_order,t.archived FROM object_types t JOIN games g ON g.id=t.game_id WHERE t.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived)
 	return item, err
 }
 
@@ -443,7 +468,7 @@ func validateFieldOptions(fieldType string, raw json.RawMessage) error {
 	switch fieldType {
 	case "select":
 		choices, ok := options["choices"].([]any)
-		if !ok || len(choices) == 0 {
+		if !ok || len(choices) == 0 || len(choices) > 200 {
 			return errText("Select fields need at least one choice.")
 		}
 		seen := map[string]bool{}
@@ -465,7 +490,7 @@ func validateFieldOptions(fieldType string, raw json.RawMessage) error {
 		}
 	case "formula":
 		expr, ok := options["expression"].(string)
-		if !ok || strings.TrimSpace(expr) == "" {
+		if !ok || strings.TrimSpace(expr) == "" || len(expr) > 4096 {
 			return errText("Formula fields need an expression.")
 		}
 	}
@@ -503,21 +528,30 @@ func (a *API) validateFieldTypeOptions(ctx context.Context, gameID, fieldType st
 
 func (a *API) validateFormulaSchema(ctx context.Context, typeID, fieldID string, options json.RawMessage) error {
 	var config struct {
-		Expression string `json:"expression"`
+		Expression  string                   `json:"expression"`
+		Aggregation *relationshipAggregation `json:"aggregation"`
 	}
 	if err := json.Unmarshal(options, &config); err != nil {
 		return errText("Formula options must contain an expression.")
+	}
+	if config.Aggregation != nil {
+		if err := a.validateAggregation(ctx, typeID, *config.Aggregation); err != nil {
+			return err
+		}
 	}
 	refs := formula.References(config.Expression)
 	if len(refs) == 0 {
 		return errText("Formula must reference at least one numeric field.")
 	}
 	for _, ref := range refs {
+		if ref == "related" && config.Aggregation != nil {
+			continue
+		}
 		if ref == fieldID {
 			return errText("A formula cannot reference itself.")
 		}
 		var typ string
-		if err := a.db.QueryRowContext(ctx, `SELECT field_type FROM field_definitions WHERE id=? AND object_type_id=?`, ref, typeID).Scan(&typ); err != nil {
+		if err := a.db.QueryRowContext(ctx, `SELECT field_type FROM field_definitions WHERE id=? AND object_type_id=? AND archived=0`, ref, typeID).Scan(&typ); err != nil {
 			return errText("Every formula reference must be a field on this object type.")
 		}
 		if typ != "integer" && typ != "decimal" && typ != "percentage" && typ != "progress" && typ != "formula" {
@@ -528,6 +562,12 @@ func (a *API) validateFormulaSchema(ctx context.Context, typeID, fieldID string,
 	visited := map[string]bool{}
 	var visit func(string) error
 	visit = func(id string) error {
+		if id == "related" {
+			return nil
+		}
+		if len(visited) > 128 {
+			return errText("Formula dependencies exceed 128 fields.")
+		}
 		if id == fieldID {
 			return errText("This formula would create a circular dependency.")
 		}
@@ -565,13 +605,13 @@ func (a *API) validateFormulaSchema(ctx context.Context, typeID, fieldID string,
 func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, error) {
 	deps := make([]string, 0)
 	var goalCount int
-	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goals WHERE field_id=?`, fieldID).Scan(&goalCount); err != nil {
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goals WHERE field_id=? OR EXISTS (SELECT 1 FROM json_each(goals.target_json, '$.conditions') c WHERE json_extract(c.value, '$.field_id')=?)`, fieldID, fieldID).Scan(&goalCount); err != nil {
 		return nil, err
 	}
 	if goalCount > 0 {
 		deps = append(deps, "goal conditions")
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT id,options_json FROM field_definitions WHERE field_type='formula' AND archived=0`)
+	rows, err := a.db.QueryContext(ctx, `SELECT id,options_json FROM field_definitions WHERE field_type='formula' AND archived=0 AND object_type_id IN (SELECT id FROM object_types WHERE game_id=(SELECT t.game_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=?))`, fieldID)
 	if err != nil {
 		return nil, err
 	}
@@ -584,9 +624,14 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 			return nil, err
 		}
 		var cfg struct {
-			Expression string `json:"expression"`
+			Expression  string                   `json:"expression"`
+			Aggregation *relationshipAggregation `json:"aggregation"`
 		}
 		_ = json.Unmarshal(raw, &cfg)
+		if cfg.Aggregation != nil && (cfg.Aggregation.RelationshipFieldID == fieldID || cfg.Aggregation.FieldID == fieldID) {
+			formulaIDs = append(formulaIDs, id)
+			continue
+		}
 		for _, ref := range formula.References(cfg.Expression) {
 			if ref == fieldID {
 				formulaIDs = append(formulaIDs, id)
@@ -608,7 +653,7 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 		}
 		deps = append(deps, "formula: "+name)
 	}
-	sectionRows, err := a.db.QueryContext(ctx, `SELECT name,display_config FROM sections WHERE archived=0`)
+	sectionRows, err := a.db.QueryContext(ctx, `SELECT name,display_config FROM sections WHERE archived=0 AND game_id=(SELECT t.game_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=?)`, fieldID)
 	if err != nil {
 		return nil, err
 	}
@@ -620,10 +665,20 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 			return nil, err
 		}
 		var config struct {
-			ChecklistFieldID string `json:"checklist_field_id"`
-			ProgressFieldID  string `json:"progress_field_id"`
+			ChecklistFieldID   string   `json:"checklist_field_id"`
+			ProgressFieldID    string   `json:"progress_field_id"`
+			CurrentFields      []string `json:"progress_current_field_ids"`
+			MaximumFields      []string `json:"progress_max_field_ids"`
+			RelationshipField  string   `json:"progress_relationship_field_id"`
+			ChildProgressField string   `json:"progress_child_field_id"`
 		}
 		_ = json.Unmarshal(raw, &config)
+		for _, id := range append(append([]string{}, config.CurrentFields...), append(config.MaximumFields, config.RelationshipField, config.ChildProgressField)...) {
+			if id == fieldID {
+				deps = append(deps, "calculated progress: "+name)
+				break
+			}
+		}
 		if config.ChecklistFieldID == fieldID {
 			deps = append(deps, "checklist view: "+name)
 		}

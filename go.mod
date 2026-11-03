@@ -3,6 +3,7 @@ module gametracker
 go 1.25.0
 
 require (
+	golang.org/x/image v0.43.0
 	golang.org/x/crypto v0.33.0
 	modernc.org/sqlite v1.53.0
 )

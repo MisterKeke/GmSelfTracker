@@ -25,6 +25,16 @@ export async function request(path, options = {}) {
 }
 
 export async function getItems(path) {
-  const result = await request(path);
-  return result?.items || [];
+  const items = [];
+  const url = new URL(path, window.location.origin);
+  let offset = Number(url.searchParams.get('offset') || 0);
+  while (true) {
+    url.searchParams.set('offset', offset);
+    const result = await request(url.pathname + url.search);
+    items.push(...(result?.items || []));
+    if (!result?.limit || result.items.length < result.limit) return items;
+    offset += result.limit;
+    if (offset > 1000000) throw new Error('This collection exceeds the supported pagination range.');
+    url.searchParams.set('offset', offset);
+  }
 }

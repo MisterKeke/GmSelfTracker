@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -293,16 +294,30 @@ func TestUploadValidationAndOwnership(t *testing.T) {
 	if status != http.StatusUnsupportedMediaType {
 		t.Fatalf("invalid upload status=%d body=%s", status, data)
 	}
-	png, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jXT8AAAAASUVORK5CYII=")
-	status, data = u.multipart("/api/assets", png, "pixel.png")
+	var encodedPNG bytes.Buffer
+	if err := png.Encode(&encodedPNG, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	status, data = u.multipart("/api/assets", encodedPNG.Bytes()[:33], "incomplete.png")
+	if status != http.StatusUnsupportedMediaType {
+		t.Fatalf("accepted incomplete pixel data: %d %s", status, data)
+	}
+	status, data = u.multipart("/api/assets", encodedPNG.Bytes(), "pixel.png")
 	if status != http.StatusCreated {
 		t.Fatalf("valid png upload: status=%d body=%s", status, data)
 	}
 	assetID := mapString(decodeMap(t, data), "id")
 	u.expect("GET", "/api/assets/"+assetID, nil, http.StatusOK)
+	game := decodeMap(t, u.expect("POST", "/api/games", map[string]any{"name": "Image owner", "cover_image": "/api/assets/" + assetID}, http.StatusCreated))
+	u.expect("DELETE", "/api/assets/"+assetID, nil, http.StatusConflict)
 	other := e.client()
 	other.register("other_asset_user")
 	other.expect("GET", "/api/assets/"+assetID, nil, http.StatusNotFound)
+	other.expect("DELETE", "/api/assets/"+assetID, nil, http.StatusNotFound)
+	u.expect("PATCH", "/api/games/"+mapString(game, "id"), map[string]any{"cover_image": ""}, http.StatusOK)
+	u.expect("DELETE", "/api/assets/"+assetID, nil, http.StatusNoContent)
+	u.expect("GET", "/api/assets/"+assetID, nil, http.StatusNotFound)
+
 }
 
 func TestCustomFieldTypesAndNumericGoalProgress(t *testing.T) {

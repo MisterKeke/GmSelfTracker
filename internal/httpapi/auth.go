@@ -28,34 +28,36 @@ type loginLimiter struct {
 
 func newLoginLimiter() *loginLimiter { return &loginLimiter{attempts: make(map[string]loginAttempt)} }
 
-func (l *loginLimiter) allowed(key string) bool {
+// Reserve before password hashing, including successful attempts, so parallel
+// requests cannot all pass a separate check. Keep memory bounded under IP churn.
+func (l *loginLimiter) take(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
+	if len(l.attempts) >= 10000 {
+		for k, attempt := range l.attempts {
+			if now.Sub(attempt.window) >= 5*time.Minute {
+				delete(l.attempts, k)
+			}
+		}
+		if _, exists := l.attempts[key]; !exists && len(l.attempts) >= 10000 {
+			return false
+		}
+	}
 	attempt := l.attempts[key]
 	if now.Sub(attempt.window) >= 5*time.Minute {
 		attempt = loginAttempt{window: now}
 	}
-	return attempt.count < 10
-}
-
-func (l *loginLimiter) fail(key string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	attempt := l.attempts[key]
-	if now.Sub(attempt.window) >= 5*time.Minute {
-		attempt = loginAttempt{window: now}
+	if attempt.count >= 10 {
+		return false
 	}
 	attempt.count++
 	l.attempts[key] = attempt
+	return true
 }
 
-func (l *loginLimiter) reset(key string) {
-	l.mu.Lock()
-	delete(l.attempts, key)
-	l.mu.Unlock()
-}
+// Use the same bcrypt work for unknown accounts to avoid a fast username oracle.
+const dummyPasswordHash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
 
 func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	var input struct {
@@ -110,12 +112,6 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	key := clientIP(r)
-	if !a.limiter.allowed(key) {
-		w.Header().Set("Retry-After", "300")
-		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many login attempts. Try again in a few minutes.")
-		return
-	}
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -123,14 +119,20 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	var id, passwordHash string
-	err := a.db.QueryRowContext(r.Context(), `SELECT id, password_hash FROM users WHERE username = ? COLLATE NOCASE`, strings.TrimSpace(input.Username)).Scan(&id, &passwordHash)
-	if err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.Password)) != nil {
-		a.limiter.fail(key)
+	if len(input.Password) > 72 || len(input.Password) < 10 || !usernamePattern.MatchString(strings.TrimSpace(input.Username)) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
-	a.limiter.reset(key)
+	var id, passwordHash string
+	err := a.db.QueryRowContext(r.Context(), `SELECT id, password_hash FROM users WHERE username = ? COLLATE NOCASE`, strings.TrimSpace(input.Username)).Scan(&id, &passwordHash)
+	if err != nil {
+		passwordHash = dummyPasswordHash
+	}
+	passwordErr := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.Password))
+	if err != nil || passwordErr != nil {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
+		return
+	}
 	user, token, err := a.newSession(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "login_failed", "Could not start a session.")
@@ -181,12 +183,30 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "password_update_failed", "Could not update password.")
 		return
 	}
-	if _, err := a.db.ExecContext(r.Context(), `UPDATE users SET password_hash=? WHERE id=?`, string(hash), user.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "password_update_failed", "Could not update password.")
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "password_update_failed", "Could not update password.")
 		return
 	}
-	if cookie, err := r.Cookie("gametracker_session"); err == nil {
-		_, _ = a.db.ExecContext(r.Context(), `DELETE FROM sessions WHERE user_id=? AND token_hash<>?`, user.ID, tokenHash(cookie.Value))
+	defer tx.Rollback()
+	// Compare-and-swap prevents simultaneous password changes from overwriting one another.
+	result, err := tx.ExecContext(r.Context(), `UPDATE users SET password_hash=? WHERE id=? AND password_hash=?`, string(hash), user.ID, currentHash)
+	if err != nil {
+		writeError(w, 500, "password_update_failed", "Could not update password.")
+		return
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		writeError(w, 409, "password_changed", "Your password changed. Sign in again.")
+		return
+	}
+	cookie, _ := r.Cookie("gametracker_session")
+	if _, err = tx.ExecContext(r.Context(), `DELETE FROM sessions WHERE user_id=? AND token_hash<>?`, user.ID, tokenHash(cookie.Value)); err != nil {
+		writeError(w, 500, "password_update_failed", "Could not revoke other sessions.")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "password_update_failed", "Could not update password.")
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

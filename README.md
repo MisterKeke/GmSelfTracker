@@ -61,12 +61,12 @@ The database and uploads are ignored by Git. Set environment variables before `m
 ## Core concepts
 
 - **Game:** the owner-scoped data boundary.
-- **Section:** a custom, nested view that organizes object references. Sections support cards, lists, tables with selectable fields, checklists backed by a user-defined checkbox field, and progress views backed by a user-defined current/maximum field.
+- **Section:** a custom, nested view that organizes object references. Sections support cards, lists, tables with selectable fields, checklists backed by a user-defined checkbox field, and progress calculated from a progress field, multiple numeric fields, or linked child objects. Goals can be placed in multiple sections with shared progress.
 - **Object type:** a user-defined schema such as “Character”, “Location”, or “Project”. These names have no special backend meaning.
 - **Field definition:** a typed characteristic attached to an object type. Its type is immutable after creation. Fields can be archived and restored without losing values.
 - **Object:** a game-level record with one object type. Objects are not copied when placed into sections.
 - **Field value:** data for one object and one stable field ID. Ordinary values are validated by Go and stored as JSON in a relational table. Object references use a separate relational table and are restricted to the same game.
-- **Goal:** a game-level manual goal, checklist, numeric tracker, or live target linked to a numeric object field.
+- **Goal:** a game-level manual goal, checklist, numeric tracker, or live rules using numeric, text, select, checkbox, and date fields with all/any conditions.
 
 See [docs/architecture.md](docs/architecture.md) for the schema and ownership boundaries.
 
@@ -74,17 +74,17 @@ See [docs/architecture.md](docs/architecture.md) for the schema and ownership bo
 
 Text, long text, integer, decimal, percentage, checkbox, select, date, current/maximum progress, single object reference, multiple object references, and calculated formula.
 
-Calculated formulas are read-only and use a small arithmetic grammar. Reference fields use stable IDs such as `@{a-stable-field-id}`. The evaluator accepts numbers, parentheses, unary signs, addition, subtraction, multiplication, and division. It does not execute JavaScript or user code. Formula references must point to numeric fields on the same object type; cross-object aggregation is not implemented.
+Calculated formulas are read-only and use a small arithmetic grammar. Reference fields use stable IDs such as `@{a-stable-field-id}`. The evaluator accepts numbers, parentheses, unary signs, addition, subtraction, multiplication, and division. It does not execute JavaScript or user code. Ordinary formula references point to numeric fields on the same object type. An optional relationship aggregation provides `@{related}` using sum, average, minimum, maximum, or count over active linked objects. Aggregation targets ordinary numeric/progress fields; recursive cross-object formulas are excluded.
 
 ## Authentication and privacy
 
-Passwords use bcrypt. Authenticated sessions use random opaque IDs stored as hashes in SQLite and HttpOnly, SameSite cookies. State-changing API requests require a CSRF token. Private queries check the current user through the game owner. Login attempts are rate-limited per client IP in the running process.
+Passwords use bcrypt. Authenticated sessions use random opaque IDs stored as hashes in SQLite and HttpOnly, SameSite cookies. State-changing API requests require a CSRF token. Private queries check the current user through the game owner. Registration, login, and password changes share an atomic limit of 10 attempts per client IP per five minutes, including successful attempts, with bounded concurrent password hashing. Browser origin checks protect state-changing endpoints, including login; JSON endpoints require `application/json`. API responses are not cached. Session creation removes expired sessions and retains up to 20 sessions per account. Password changes revoke other sessions in the same transaction.
 
 This is a local development application. Production deployment still needs an HTTPS reverse proxy, backups, operational monitoring, and a deployment-specific security review.
 
 ## Images
 
-Game covers and object images are stored locally. Uploads accept valid PNG, JPEG, and GIF images up to 5 MB, with dimension limits. User-provided images are used in place of bundled game artwork.
+Game covers, game/section/type/field icons, type images, and object images can use local uploads. Uploads accept PNG, JPEG, GIF, WebP, and BMP up to 5 MB. Images are decoded and normalized to PNG; animated formats use their first frame. Both the input and processed image must fit within 5 MB, 6000 × 6000, and 16 million pixels. Each account can store 1000 images or 250 MB; Profile & Settings lists uploads and allows deletion of unused images. Images referenced by active or archived records are protected from deletion.
 
 ## Example workflow
 
@@ -110,16 +110,26 @@ The API uses JSON and authenticated cookies. Main route groups:
 
 Errors use a JSON `error` object containing a stable code and readable message. Collections support pagination where they can grow most quickly (games and objects).
 
+## Local features
+
+- **Rules:** Create a goal, choose rules based on object fields, and add up to 20 conditions. Choose all or any. Numeric comparisons, date comparisons, text equality/contains, choices, and checkboxes are supported. Missing or archived objects do not satisfy conditions.
+- **Relationship calculations:** Create a reference field first, then a formula field. Choose the relationship, operation, and a linked numeric field; use `@{related}` in the expression, optionally alongside ordinary `@{field-id}` references. Count needs no numeric target. Missing numeric values are skipped; empty sums/counts are zero, while empty averages/minimums/maximums show an error.
+- **Calculated progress:** Edit a section and select progress view. Choose one progress field, sums of numeric fields from one type (with either maximum fields or a fixed maximum), or sums of linked child progress. Child rollups follow one explicit reference field and read each child's current/maximum field without recursively traversing relationships.
+- **Image icons:** Game, section, type, and field forms accept icon image uploads. A type image also provides a default picture for its object cards.
+- **Type lifecycle:** Archive or restore a type in Types & Fields. Its objects are hidden from active views while archived; values and placements are preserved.
+- **Goals in sections:** Use “＋ Goal” in a section to place an existing goal. “Remove here” removes only the placement. Goal values remain shared across sections.
+- **Larger libraries:** The browser follows API pagination instead of stopping at the first 100 games or objects.
+
+Existing databases receive migration 002 automatically on the next server start. No migration is applied merely by editing the source.
+
 ## Current limits
 
-- No email, password reset, cloud sync, game-service imports, or multi-user sharing.
-- Formula calculations work on numeric fields of the same object. Relationship aggregation is not implemented.
-- Goal targets currently support numeric values; date, text, and multi-condition goal rules are not implemented.
-- Calculated progress from multiple fields and parent progress from child objects are not implemented; progress views use an explicitly selected current/maximum field.
-- Custom image uploads for field icons, object type icons, section images, and game icons are not yet available. Game cover and object image uploads work.
-- Object types cannot yet be archived. Games, sections, objects, and fields have archive/restore paths.
-- Goals are managed in the game workspace and are not yet placeable into custom sections.
-- Uploads accept PNG, JPEG, and GIF only.
+- Email, password reset, cloud sync, game-service imports, and multi-user sharing remain outside this local-only application.
+- Relationship aggregation targets ordinary numeric/progress fields, not formulas on other objects. Child progress rollups use directly linked children, not recursive hierarchies.
+- New animated image uploads are stored as a static first frame. SVG, AVIF, and HEIC uploads are unsupported.
+- Progress view calculations are display settings; they do not overwrite stored object fields.
+
+See [the security review](docs/security-review.md) for findings, fixes, and validation scope.
 
 ## Tests
 
@@ -129,4 +139,4 @@ Run:
 make test
 ```
 
-Tests use temporary SQLite databases and in-process HTTP handlers. They cover migrations, authentication, ownership isolation, CSRF, shared placements, field validation and lifecycle, formulas, relationships, linked goal progress, and image validation.
+Tests use temporary SQLite databases and in-process HTTP handlers. Coverage includes migrations, authentication, ownership isolation, CSRF/origin checks, concurrent authentication limiting, shared placements, field validation and lifecycle, formulas, relationships, multi-condition goals, type archiving, and image validation. The latest changes were source-reviewed and formatted; tests and browser checks were intentionally not run at the user’s request.
