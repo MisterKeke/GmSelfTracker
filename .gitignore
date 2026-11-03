@@ -1,0 +1,7 @@
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+/data/uploads/
+/bin/
+/.gocache/
+*.exe
