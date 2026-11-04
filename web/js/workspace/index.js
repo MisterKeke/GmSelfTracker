@@ -30,30 +30,39 @@ export function initWorkspace(root, user) {
     remembered=null;
     if (state.game && !state.games.some((game) => game.id === state.game.id)) state.game = null;
     if (!state.game && state.games.length) state.game = state.games[0];
-    if (!state.game) { state.sections = []; state.types = []; state.objects = []; state.goals = []; render(); return; }
+    if (!state.game) { state.sections = []; state.types = []; state.objects = []; state.objectCache.clear(); state.objectTotal=0; state.gameObjectTotal=0; state.goals = []; state.sectionGoals=[];state.goalCache.clear();state.goalStats={total:0,completed:0};render(); return; }
     const gameID = state.game.id;
-    const [freshGame, sections, types, objects, goals] = await Promise.all([
+    const [freshGame, sections, types] = await Promise.all([
       request(`/api/games/${gameID}`),
       getItems(`/api/games/${gameID}/sections?archived=true`),
       getItems(`/api/games/${gameID}/object-types?archived=true`),
-      getItems(`/api/games/${gameID}/objects`),
-      getItems(`/api/games/${gameID}/goals`),
+    ]);
+    if(version!==generation)return;
+    if (state.sectionId && !sections.some((section) => section.id === state.sectionId && !section.archived)) state.sectionId = null;
+    const goalParams=new URLSearchParams({sort:'updated_at',direction:'desc',limit:'3',offset:'0'});
+    const sectionGoalsURL=state.panel==='section'&&state.sectionId?`/api/games/${gameID}/goals?section_id=${encodeURIComponent(state.sectionId)}`:'';
+    const [goalOverview,sectionGoals]=await Promise.all([
+      request(`/api/games/${gameID}/goals?${goalParams}`),
+      sectionGoalsURL?getItems(sectionGoalsURL):Promise.resolve([]),
     ]);
     if(version!==generation)return;
     if (state.game?.id === gameID) {
       state.game = freshGame;
       state.sections = sections;
       state.types = types;
-      state.objects = objects;
-      state.goals = goals;
-      if (state.sectionId && !sections.some((section) => section.id === state.sectionId && !section.archived)) state.sectionId = null;
+      state.goals = goalOverview.items||[];
+      state.sectionGoals = sectionGoals;
+      state.goalCache = new Map([...state.goals,...sectionGoals].map(goal=>[goal.id,goal]));
+      state.goalStats = {total:Number(goalOverview.game_total)||0,completed:Number(goalOverview.completed_total)||0};
+      state.objectCache.clear();
     }
+    await actions.refreshObjects(false);
+    if(version!==generation)return;
     render();
   }
 
   function render() {
     try {localStorage.setItem(navigationKey,JSON.stringify({gameID:state.game?.id,panel:state.panel,sectionId:state.sectionId,expanded:[...state.expanded]}));}catch{}
-    const totalObjects = state.objects.length;
     const dialog=root.querySelector('#app-modal');
     const markup = `
       <div class="app-frame">
@@ -70,7 +79,7 @@ export function initWorkspace(root, user) {
             <div class="game-list">${renderGameList()}</div>
             <button class="pixel-button" type="button" data-action="new-game">＋ Add Game</button>
             <div class="sidebar-spacer"></div>
-            <section class="quick-stats"><h3>▥ QUICK STATS</h3><div class="stat-row"><span>✦ Games</span><strong>${state.games.length}</strong></div><div class="stat-row"><span>◈ Objects</span><strong>${totalObjects}</strong></div><div class="stat-row"><span>▣ Sections</span><strong>${state.sections.filter((item) => !item.archived).length}</strong></div><div class="stat-row"><span>◎ Goals done</span><strong>${state.goals.filter((goal) => goal.completed).length} / ${state.goals.length}</strong></div></section>
+            <section class="quick-stats"><h3>▥ QUICK STATS</h3><div class="stat-row"><span>✦ Games</span><strong>${state.games.length}</strong></div><div class="stat-row"><span>◈ Objects</span><strong>${Number(state.gameObjectTotal)||0}</strong></div><div class="stat-row"><span>▣ Sections</span><strong>${state.sections.filter((item) => !item.archived).length}</strong></div><div class="stat-row"><span>◎ Goals done</span><strong>${state.goalStats.completed} / ${state.goalStats.total}</strong></div></section>
           </aside>
           <main class="main">
             ${state.game ? renderGame() : renderWelcome()}
@@ -97,9 +106,9 @@ export function initWorkspace(root, user) {
   // Late-bound callbacks keep module dependencies one-way; state stays private to this workspace.
   const actions = {};
   const context = { root, state, load, render, openForm, fieldRow, toast, run };
-  for (const name of ["renderObjectList", "renderObjectTable", "renderChecklistView", "renderProgressView", "objectProgress", "renderObjectCard", "renderGoals", "renderGoal", "renderPanel", "renderOverview", "renderLibrary", "renderLibraryResults", "refreshLibraryResults", "renderSection", "renderSchema", "renderWelcome", "renderGameList", "renderGame", "tab", "openGameForm", "openSectionForm", "openTypeForm", "openAddExisting", "openAddExistingGoal", "openFieldForm", "renderChoiceMigrations", "fieldOptionsHTML", "openObjectForm", "renderFieldInput", "readValues", "openGoalForm", "renderGoalSpecific", "addConditionRow", "updateConditionRow", "readGoalConditions", "openAddTask", "openProfile", "submitForm", "uploadImage"]) context[name] = (...args) => actions[name](...args);
+  for (const name of ["renderObjectList", "renderObjectTable", "renderChecklistView", "renderProgressView", "objectProgress", "renderObjectCard", "renderGoals", "renderGoal", "renderPanel", "renderOverview", "renderLibrary", "renderLibraryResults", "refreshLibraryResults", "refreshObjects", "renderSection", "renderSchema", "renderWelcome", "renderGameList", "renderGame", "tab", "openGameForm", "openSectionForm", "openTypeForm", "openAddExisting", "openAddExistingGoal", "openFieldForm", "renderChoiceMigrations", "fieldOptionsHTML", "openObjectForm", "renderFieldInput", "readValues", "openGoalForm", "renderGoalSpecific", "addConditionRow", "updateConditionRow", "readGoalConditions", "openAddTask", "openProfile", "submitForm", "uploadImage"]) context[name] = (...args) => actions[name](...args);
   const { renderGameList, renderGame, renderWelcome, renderPanel } = context;
-  for (const name of ['getObjectView','filterObjects','renderObjectControls','readGoalTasks']) context[name] = (...args) => actions[name](...args);
+  for (const name of ['getObjectView','renderObjectControls','readGoalTasks']) context[name] = (...args) => actions[name](...args);
   Object.assign(actions, createObjectBrowser(context));
   for (const name of ['renderSectionTree','moveSection','openMoveSection','shiftSection']) context[name] = (...args) => actions[name](...args);
   Object.assign(actions, createSectionTree(context));
@@ -119,5 +128,9 @@ export function initWorkspace(root, user) {
     input.value=button.dataset.iconChoice;input.dispatchEvent(new Event('input',{bubbles:true}));
   });
   bindWorkspaceEvents(context);
-  load().catch((error)=>{root.innerHTML=`<main class="auth-screen"><section class="auth-card"><div class="auth-inner"><h1 class="auth-title">COULD NOT OPEN THE LIBRARY</h1><p class="auth-copy">${esc(error.message)}</p><button class="pixel-button gold" type="button" data-action="reload">TRY AGAIN</button></div></section></main>`;});
+  const showLoadError=(error)=>{
+    root.innerHTML=`<main class="auth-screen"><section class="auth-card"><div class="auth-inner"><h1 class="auth-title">COULD NOT OPEN THE LIBRARY</h1><p class="auth-copy" role="alert">${esc(error.message)}</p><button class="pixel-button gold" type="button" data-retry-workspace>TRY AGAIN</button></div></section></main>`;
+    root.querySelector('[data-retry-workspace]').addEventListener('click',()=>load().catch(showLoadError));
+  };
+  load().catch(showLoadError);
 }

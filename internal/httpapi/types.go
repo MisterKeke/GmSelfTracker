@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -419,19 +421,30 @@ func (a *API) setFieldArchived(w http.ResponseWriter, r *http.Request, archived 
 		notFoundOrError(w, err, "Field")
 		return
 	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update field.")
+		return
+	}
+	defer tx.Rollback()
 	if archived {
-		dependencies, err := a.fieldDependencies(r.Context(), item.ID)
+		dependencies, err := a.fieldDependencies(r.Context(), tx, item.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not check field dependencies.")
 			return
 		}
 		if len(dependencies) > 0 {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]string{"code": "field_in_use", "message": "Remove or update these dependencies before archiving this field."}, "dependencies": dependencies})
+			message := fmt.Sprintf("Cannot archive %q. This field is currently used by:\n\n- %s\n\nUpdate these dependencies before archiving the field.", item.Name, strings.Join(dependencies, "\n- "))
+			writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]string{"code": "field_in_use", "message": message}, "dependencies": dependencies})
 			return
 		}
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE field_definitions SET archived=?,updated_at=? WHERE id=?`, boolInt(archived), time.Now().UTC().Format(time.RFC3339), item.ID)
+	_, err = tx.ExecContext(r.Context(), `UPDATE field_definitions SET archived=?,updated_at=? WHERE id=?`, boolInt(archived), time.Now().UTC().Format(time.RFC3339), item.ID)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update field.")
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update field.")
 		return
 	}
@@ -654,24 +667,32 @@ func (a *API) validateFormulaSchema(ctx context.Context, typeID, fieldID string,
 	return nil
 }
 
-func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, error) {
+func (a *API) fieldDependencies(ctx context.Context, db dbExecutor, fieldID string) ([]string, error) {
 	deps := make([]string, 0)
+	var gameID string
+	if err := db.QueryRowContext(ctx, `SELECT t.game_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=?`, fieldID).Scan(&gameID); err != nil {
+		return nil, err
+	}
 	var goalCount int
-	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goals WHERE field_id=? OR EXISTS (SELECT 1 FROM json_each(goals.target_json, '$.conditions') c WHERE json_extract(c.value, '$.field_id')=?)`, fieldID, fieldID).Scan(&goalCount); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goals WHERE game_id=? AND (field_id=? OR EXISTS (SELECT 1 FROM json_each(goals.target_json, '$.conditions') c WHERE json_extract(c.value, '$.field_id')=?))`, gameID, fieldID, fieldID).Scan(&goalCount); err != nil {
 		return nil, err
 	}
 	if goalCount > 0 {
 		deps = append(deps, "goal conditions")
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT id,options_json FROM field_definitions WHERE field_type='formula' AND archived=0 AND object_type_id IN (SELECT id FROM object_types WHERE game_id=(SELECT t.game_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=?))`, fieldID)
+	rows, err := db.QueryContext(ctx, `SELECT f.id,f.name,f.options_json FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.field_type='formula' AND t.game_id=?`, gameID)
 	if err != nil {
 		return nil, err
 	}
-	formulaIDs := make([]string, 0)
+	type formulaDependency struct {
+		name string
+		refs []string
+	}
+	formulas := make(map[string]formulaDependency)
 	for rows.Next() {
-		var id string
+		var id, name string
 		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
+		if err := rows.Scan(&id, &name, &raw); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -680,16 +701,11 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 			Aggregation *relationshipAggregation `json:"aggregation"`
 		}
 		_ = json.Unmarshal(raw, &cfg)
-		if cfg.Aggregation != nil && (cfg.Aggregation.RelationshipFieldID == fieldID || cfg.Aggregation.FieldID == fieldID) {
-			formulaIDs = append(formulaIDs, id)
-			continue
+		refs := formula.References(cfg.Expression)
+		if cfg.Aggregation != nil {
+			refs = append(refs, cfg.Aggregation.RelationshipFieldID, cfg.Aggregation.FieldID)
 		}
-		for _, ref := range formula.References(cfg.Expression) {
-			if ref == fieldID {
-				formulaIDs = append(formulaIDs, id)
-				break
-			}
-		}
+		formulas[id] = formulaDependency{name: name, refs: refs}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -698,25 +714,61 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	for _, id := range formulaIDs {
-		var name string
-		if err := a.db.QueryRowContext(ctx, `SELECT name FROM field_definitions WHERE id=?`, id).Scan(&name); err != nil {
-			return nil, err
+	for id, candidate := range formulas {
+		seen := make(map[string]bool)
+		var dependsOn func(string) bool
+		dependsOn = func(current string) bool {
+			if current == fieldID {
+				return true
+			}
+			if seen[current] {
+				return false
+			}
+			seen[current] = true
+			for _, ref := range formulas[current].refs {
+				if ref == fieldID || dependsOn(ref) {
+					return true
+				}
+			}
+			return false
 		}
-		deps = append(deps, "formula: "+name)
+		if dependsOn(id) {
+			deps = append(deps, "formula: "+candidate.name)
+		}
 	}
-	sectionRows, err := a.db.QueryContext(ctx, `SELECT name,display_config FROM sections WHERE archived=0 AND game_id=(SELECT t.game_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=?)`, fieldID)
+	sectionRows, err := db.QueryContext(ctx, `SELECT name,display_config,archived FROM sections WHERE game_id=? ORDER BY sort_order,name,id`, gameID)
 	if err != nil {
 		return nil, err
 	}
 	for sectionRows.Next() {
 		var name string
 		var raw []byte
-		if err := sectionRows.Scan(&name, &raw); err != nil {
+		var archived int
+		if err := sectionRows.Scan(&name, &raw, &archived); err != nil {
 			sectionRows.Close()
 			return nil, err
 		}
+		sectionLabel := name
+		if archived != 0 {
+			sectionLabel = "archived section: " + name
+		}
+		var display map[string]json.RawMessage
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &display); err != nil {
+				sectionRows.Close()
+				return nil, fmt.Errorf("invalid saved section display configuration: %w", err)
+			}
+		}
+		viewDependencies, err := savedViewFieldDependencies(display, fieldID)
+		if err != nil {
+			sectionRows.Close()
+			return nil, fmt.Errorf("invalid saved object view: %w", err)
+		}
+		for _, dependency := range viewDependencies {
+			deps = append(deps, sectionLabel+": "+dependency)
+		}
 		var config struct {
+			VisibleFields      []string `json:"visible_field_ids"`
 			ChecklistFieldID   string   `json:"checklist_field_id"`
 			ProgressFieldID    string   `json:"progress_field_id"`
 			CurrentFields      []string `json:"progress_current_field_ids"`
@@ -724,18 +776,29 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 			RelationshipField  string   `json:"progress_relationship_field_id"`
 			ChildProgressField string   `json:"progress_child_field_id"`
 		}
-		_ = json.Unmarshal(raw, &config)
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &config); err != nil {
+				sectionRows.Close()
+				return nil, fmt.Errorf("invalid saved section display configuration: %w", err)
+			}
+		}
+		for _, id := range config.VisibleFields {
+			if id == fieldID {
+				deps = append(deps, sectionLabel+": visible fields")
+				break
+			}
+		}
 		for _, id := range append(append([]string{}, config.CurrentFields...), append(config.MaximumFields, config.RelationshipField, config.ChildProgressField)...) {
 			if id == fieldID {
-				deps = append(deps, "calculated progress: "+name)
+				deps = append(deps, sectionLabel+": calculated progress")
 				break
 			}
 		}
 		if config.ChecklistFieldID == fieldID {
-			deps = append(deps, "checklist view: "+name)
+			deps = append(deps, sectionLabel+": checklist view")
 		}
 		if config.ProgressFieldID == fieldID {
-			deps = append(deps, "progress view: "+name)
+			deps = append(deps, sectionLabel+": progress view")
 		}
 	}
 	if err := sectionRows.Err(); err != nil {
@@ -745,7 +808,78 @@ func (a *API) fieldDependencies(ctx context.Context, fieldID string) ([]string, 
 	if err := sectionRows.Close(); err != nil {
 		return nil, err
 	}
+	sort.Strings(deps)
 	return deps, nil
+}
+
+// savedViewFieldDependencies inspects parsed JSON properties whose names denote
+// stable field references. It never searches serialized JSON text or arbitrary
+// values, which could produce false dependencies from titles or filter targets.
+func savedViewFieldDependencies(config map[string]json.RawMessage, fieldID string) ([]string, error) {
+	viewRaw := config["object_view"]
+	if len(viewRaw) == 0 {
+		return nil, nil
+	}
+	var view map[string]any
+	if err := json.Unmarshal(viewRaw, &view); err != nil || view == nil {
+		return nil, fmt.Errorf("object_view must be a JSON object")
+	}
+	var validated objectView
+	if err := json.Unmarshal(viewRaw, &validated); err != nil {
+		return nil, fmt.Errorf("object_view has an invalid structure")
+	}
+	used := map[string]bool{}
+	var walk func(any, string)
+	walk = func(value any, path string) {
+		switch item := value.(type) {
+		case map[string]any:
+			for key, child := range item {
+				childPath := key
+				if path != "" {
+					childPath = path + "." + key
+				}
+				if key == "sort" {
+					if sortID, ok := child.(string); ok && sortID == fieldID {
+						used["sorting"] = true
+					}
+				}
+				if (key == "field_id" || strings.HasSuffix(key, "_field_id")) && child == fieldID {
+					if strings.Contains(path, "conditions") {
+						used["filter"] = true
+					} else {
+						used["object view ("+childPath+")"] = true
+					}
+				}
+				if key == "field_ids" || strings.HasSuffix(key, "_field_ids") {
+					if ids, ok := child.([]any); ok {
+						for _, rawID := range ids {
+							if rawID == fieldID {
+								used["object view ("+childPath+")"] = true
+							}
+						}
+					}
+				}
+				walk(child, childPath)
+			}
+		case []any:
+			for _, child := range item {
+				walk(child, path)
+			}
+		}
+	}
+	walk(view, "")
+	result := make([]string, 0, len(used))
+	for _, name := range []string{"filter", "sorting"} {
+		if used[name] {
+			result = append(result, "saved object view: "+name)
+			delete(used, name)
+		}
+	}
+	for name := range used {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 type textError string

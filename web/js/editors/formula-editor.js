@@ -6,11 +6,11 @@ export function renderFormulaEditor(options,typeFields,state,editingID='') {
   const aggregation=options.aggregation||{};
   const fields=typeFields.filter(field=>!field.archived&&numericKinds.includes(field.field_type)&&field.id!==editingID);
   const relationships=typeFields.filter(field=>!field.archived&&['reference','references'].includes(field.field_type));
-  return `<div class="formula-builder"><strong>Available fields</strong><div class="formula-field-picker">${fields.map(field=>`<button type="button" class="pixel-button small soft" data-formula-insert="@{${esc(field.id)}}">${renderIcon(field.icon)} ${esc(field.name)} <small>${esc(typeLabel(field.field_type))}</small></button>`).join('')||'<small>Create a numeric input field first, or configure relationship aggregation below.</small>'}</div><div class="formula-operators" role="group" aria-label="Formula operators">${['+','-','*','/','(',')'].map(op=>`<button type="button" class="pixel-button small" data-formula-insert="${op}" aria-label="Insert ${op}">${op}</button>`).join('')}<button type="button" class="pixel-button small" data-formula-insert="@{related}">Relationship result</button></div><label>Number to insert<div class="toolbar"><input type="number" step="any" data-formula-constant aria-label="Formula constant"><button type="button" class="pixel-button small" data-insert-constant>Insert number</button></div></label><label>Readable expression<output data-formula-readable></output></label><details class="formula-advanced"><summary>Advanced: edit stable-ID expression</summary><label>Internal expression<textarea name="expression" required maxlength="4096" placeholder="Choose fields above">${esc(options.expression||'')}</textarea></label></details><label>Relationship to aggregate (optional)<select name="aggregation_relationship"><option value="">No aggregation</option>${relationships.map(field=>`<option value="${esc(field.id)}" ${aggregation.relationship_field_id===field.id?'selected':''}>${esc(field.name)}</option>`).join('')}</select></label><label>Aggregation operation<select name="aggregation_operation">${['sum','avg','min','max','count'].map(op=>`<option value="${op}" ${aggregation.operation===op?'selected':''}>${op}</option>`).join('')}</select></label><label>Target numeric field<select name="aggregation_field" data-initial-target="${esc(aggregation.field_id||'')}"></select></label><small>Progress contributes its current value. Missing related values are skipped, as in existing formulas.</small><label>Preview using<select data-formula-object><option value="">Temporary example values</option>${state.objects.filter(object=>object.object_type_id===typeFields[0]?.object_type_id).map(object=>`<option value="${esc(object.id)}">${esc(object.name)}</option>`).join('')}</select></label><div class="formula-example-inputs">${typeFields.filter(field=>!field.archived&&['integer','decimal','percentage','progress'].includes(field.field_type)).map(field=>`<label>${esc(field.name)}${field.field_type==='progress'?' (current)':''}<input type="number" step="any" data-formula-example="${esc(field.id)}" data-example-progress="${field.field_type==='progress'}" value="${esc(field.field_type==='progress'?field.default_value?.current??'':field.default_value??'')}"></label>`).join('')}<label>Temporary relationship result<input type="number" step="any" data-formula-related></label></div><output class="formula-status" role="status" data-formula-status>Choose fields to build your expression.</output></div>`;
+  return `<div class="formula-builder"><strong>Available fields</strong><div class="formula-field-picker">${fields.map(field=>`<button type="button" class="pixel-button small soft" data-formula-insert="@{${esc(field.id)}}">${renderIcon(field.icon)} ${esc(field.name)} <small>${esc(typeLabel(field.field_type))}</small></button>`).join('')||'<small>Create a numeric input field first, or configure relationship aggregation below.</small>'}</div><div class="formula-operators" role="group" aria-label="Formula operators">${['+','-','*','/','(',')'].map(op=>`<button type="button" class="pixel-button small" data-formula-insert="${op}" aria-label="Insert ${op}">${op}</button>`).join('')}<button type="button" class="pixel-button small" data-formula-insert="@{related}">Relationship result</button></div><label>Number to insert<div class="toolbar"><input type="number" step="any" data-formula-constant aria-label="Formula constant"><button type="button" class="pixel-button small" data-insert-constant>Insert number</button></div></label><label>Readable expression<output data-formula-readable></output></label><details class="formula-advanced"><summary>Advanced: edit stable-ID expression</summary><label>Internal expression<textarea name="expression" required maxlength="4096" placeholder="Choose fields above">${esc(options.expression||'')}</textarea></label></details><label>Relationship to aggregate (optional)<select name="aggregation_relationship"><option value="">No aggregation</option>${relationships.map(field=>`<option value="${esc(field.id)}" ${aggregation.relationship_field_id===field.id?'selected':''}>${esc(field.name)}</option>`).join('')}</select></label><label>Aggregation operation<select name="aggregation_operation">${['sum','avg','min','max','count'].map(op=>`<option value="${op}" ${aggregation.operation===op?'selected':''}>${op}</option>`).join('')}</select></label><label>Target numeric field<select name="aggregation_field" data-initial-target="${esc(aggregation.field_id||'')}"></select></label><small>Progress contributes its current value. Missing related values are skipped, as in existing formulas.</small><label>Find an object for preview<input type="search" data-formula-object-search aria-label="Search objects for formula preview" placeholder="Search all objects…"></label><label>Preview using<select data-formula-object><option value="">Temporary example values</option>${state.objects.filter(object=>object.object_type_id===typeFields[0]?.object_type_id).map(object=>`<option value="${esc(object.id)}">${esc(object.name)}</option>`).join('')}</select><small data-formula-object-status role="status">Search all objects of this type, including objects beyond the current page.</small></label><div class="formula-example-inputs">${typeFields.filter(field=>!field.archived&&['integer','decimal','percentage','progress'].includes(field.field_type)).map(field=>`<label>${esc(field.name)}${field.field_type==='progress'?' (current)':''}<input type="number" step="any" data-formula-example="${esc(field.id)}" data-example-progress="${field.field_type==='progress'}" value="${esc(field.field_type==='progress'?field.default_value?.current??'':field.default_value??'')}"></label>`).join('')}<label>Temporary relationship result<input type="number" step="any" data-formula-related></label></div><output class="formula-status" role="status" data-formula-status>Choose fields to build your expression.</output></div>`;
 }
 
 export function bindFormulaEditor(form,type,state,editingID='') {
-  let timer,sequence=0;
+  let timer,sequence=0,objectSearchTimer,objectSearchSequence=0;
   const expression=form.elements.expression;
   if(!expression)return;
   const builder=form.querySelector('.formula-builder');
@@ -54,6 +54,32 @@ export function bindFormulaEditor(form,type,state,editingID='') {
   builder.addEventListener('input',schedule);
   builder.addEventListener('change',event=>{
     if(['aggregation_relationship','aggregation_operation'].includes(event.target.name))updateTargets();schedule();
+  });
+  builder.addEventListener('input',event=>{
+    const input=event.target.closest('[data-formula-object-search]');if(!input)return;
+    clearTimeout(objectSearchTimer);
+    const version=++objectSearchSequence;
+    objectSearchTimer=setTimeout(async()=>{
+      const params=new URLSearchParams({type_id:type.id,limit:'30',offset:'0',search:input.value||''});
+      const select=builder.querySelector('[data-formula-object]');
+      const selectedID=select.value;
+      const selectedLabel=select.selectedOptions[0]?.textContent;
+      const status=builder.querySelector('[data-formula-object-status]');
+      status.textContent='Searching objects…';
+      try{
+        const result=await request(`/api/games/${encodeURIComponent(state.game.id)}/objects?${params}`);
+        if(!input.isConnected||objectSearchSequence!==version)return;
+        const choices=new Map();
+        if(selectedID)choices.set(selectedID,selectedLabel||selectedID);
+        for(const object of result.items||[]){
+          choices.set(object.id,object.name);
+          state.objectCache?.set(object.id,object);
+        }
+        select.innerHTML='<option value="">Temporary example values</option>'+[...choices].map(([id,name])=>`<option value="${esc(id)}">${esc(name)}</option>`).join('');
+        select.value=selectedID;
+        status.textContent=`${result.total} matching object${result.total===1?'':'s'} found.`;
+      }catch(error){if(input.isConnected&&objectSearchSequence===version)status.textContent=error.message;}
+    },250);
   });
   builder.addEventListener('click',event=>{
     const insert=event.target.closest('[data-formula-insert],[data-insert-constant]');if(!insert)return;

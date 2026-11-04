@@ -69,6 +69,7 @@ func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) htt
 	protected("POST /api/games/{gameID}/objects", a.createObject)
 	protected("GET /api/games/{gameID}/goals", a.listGoals)
 	protected("POST /api/games/{gameID}/goals", a.createGoal)
+	protected("GET /api/goals/{goalID}", a.getGoal)
 
 	protected("PATCH /api/sections/{sectionID}", a.updateSection)
 	protected("POST /api/sections/{sectionID}/move", a.moveSection)

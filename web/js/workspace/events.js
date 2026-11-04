@@ -2,7 +2,8 @@ import { request, setCSRF } from '../api.js';
 import { closeModal, ensureDialog } from '../modal.js';
 import { esc } from '../utils/formatting.js';
 
-export function bindWorkspaceEvents({ load, render, renderGameList, refreshLibraryResults, openForm, fieldRow, openGameForm, openSectionForm, openTypeForm, openFieldForm, openObjectForm, renderFieldInput, openAddExisting, openAddExistingGoal, openGoalForm, renderGoalSpecific, addConditionRow, updateConditionRow, openAddTask, openProfile, toast, run, submitForm, state, root }) {
+export function bindWorkspaceEvents({ load, render, renderGameList, refreshLibraryResults, refreshObjects, openForm, fieldRow, openGameForm, openSectionForm, openTypeForm, openFieldForm, openObjectForm, renderFieldInput, openAddExisting, openAddExistingGoal, openGoalForm, renderGoalSpecific, addConditionRow, updateConditionRow, openAddTask, openProfile, toast, run, submitForm, state, root }) {
+  const findGoal=id=>state.goalCache?.get(id)||state.goalQueryItems?.find(item=>item.id===id)||state.sectionGoals?.find(item=>item.id===id)||state.goals.find(item=>item.id===id);
   root.addEventListener('input',(event)=>{if(event.target.id==='game-search'){state.search=event.target.value;const list=root.querySelector('.game-list');if(list)list.innerHTML=renderGameList();}});
   root.addEventListener('change',(event)=>{
     const action=event.target.dataset.action;
@@ -17,10 +18,11 @@ export function bindWorkspaceEvents({ load, render, renderGameList, refreshLibra
     if(action==='reload')window.location.reload();
     else if(action==='new-game')openGameForm(false);
     else if(action==='edit-game')openGameForm(true);
-    else if(action==='select-game'){state.game=state.games.find((item)=>item.id===id);state.sections=[];state.types=[];state.objects=[];state.goals=[];state.objectPage=0;state.panel='overview';state.sectionId=null;render();run(load);}
-    else if(action==='library-page'){state.objectPage=Math.max(0,Number(button.dataset.page)||0);refreshLibraryResults();}
-    else if(action==='select-panel'){state.panel=button.dataset.panel;state.sectionId=null;render();}
-    else if(action==='select-section'){state.panel='section';state.sectionId=id;render();}
+    else if(action==='select-game'){state.game=state.games.find((item)=>item.id===id);state.sections=[];state.types=[];state.objects=[];state.objectCache.clear();state.objectTotal=0;state.goals=[];state.sectionGoals=[];state.goalQueryItems=[];state.goalCache.clear();state.goalStats={total:0,completed:0};state.goalPage=0;state.panel='overview';state.sectionId=null;render();run(load);}
+    else if(action==='library-page'){state.objectPage=Math.max(0,Number(button.dataset.page)||0);refreshObjects();}
+    else if(action==='section-page'){state.objectPage=Math.max(0,Number(button.dataset.page)||0);refreshObjects();}
+    else if(action==='select-panel'){state.panel=button.dataset.panel;state.sectionId=null;state.objectPage=0;render();refreshObjects();}
+    else if(action==='select-section'){state.panel='section';state.sectionId=id;state.sectionGoals=[];state.objectPage=0;render();run(load);}
     else if(action==='new-section')openSectionForm();
     else if(action==='edit-section')openSectionForm(state.sections.find((item)=>item.id===id));
     else if(action==='archive-section')run(async()=>{if(!confirm('Archive only this section? Active children stay accessible at the tree root until it is restored. Objects, goals, and all placements remain saved.'))return;await request(`/api/sections/${id}`,{method:'DELETE'});state.sectionId=null;state.panel='overview';await load();toast('Section archived.');});
@@ -32,7 +34,7 @@ export function bindWorkspaceEvents({ load, render, renderGameList, refreshLibra
     else if(action==='archive-field')run(async()=>{if(!confirm('Archive this field? Existing values will be preserved.'))return;await request(`/api/fields/${id}/archive`,{method:'POST',body:{}});await load();toast('Field archived.');});
     else if(action==='restore-field')run(async()=>{await request(`/api/fields/${id}/restore`,{method:'POST',body:{}});await load();toast('Field restored.');});
     else if(action==='new-object')openObjectForm();
-    else if(action==='edit-object')openObjectForm(state.objects.find((item)=>item.id===id));
+    else if(action==='edit-object'){const object=state.objects.find((item)=>item.id===id);if(object)openObjectForm(object);else run(async()=>openObjectForm(await request(`/api/objects/${encodeURIComponent(id)}`)));}
     else if(action==='archive-object')run(async()=>{if(!confirm('Archive this object? It will be hidden from normal views and can be restored later.'))return;await request(`/api/objects/${id}/archive`,{method:'POST',body:{}});await load();toast('Object archived.');});
     else if(action==='add-existing')openAddExisting();
     else if(action==='remove-placement')run(async()=>{if(!confirm('Remove this object from the current section? The object itself stays in the game.'))return;await request(`/api/sections/${state.sectionId}/placements/${id}`,{method:'DELETE'});await load();toast('Object removed from this section.');});
@@ -41,12 +43,12 @@ export function bindWorkspaceEvents({ load, render, renderGameList, refreshLibra
     else if(action==='add-condition')addConditionRow(button.closest('form'));
     else if(action==='remove-condition')button.closest('.goal-condition').remove();
     else if(action==='new-goal')openGoalForm();
-    else if(action==='edit-goal')openGoalForm(state.goals.find(item=>item.id===id));
+    else if(action==='edit-goal')run(async()=>{let goal=findGoal(id);if(!goal){goal=await request(`/api/goals/${encodeURIComponent(id)}`);state.goalCache.set(goal.id,goal);}openGoalForm(goal);});
     else if(action==='open-goals'){state.panel='goals';render();}
-    else if(action==='toggle-goal')run(async()=>{const goal=state.goals.find((item)=>item.id===id);await request(`/api/goals/${id}`,{method:'PATCH',body:{completed:!goal.completed}});await load();});
-    else if(action==='edit-goal-progress'){const goal=state.goals.find((item)=>item.id===id);openForm('UPDATE GOAL PROGRESS',`${fieldRow('Current progress','current',goal.current,'number',true,'min="0" step="any" required')}<input type="hidden" name="goal_id" value="${esc(id)}">`,'UPDATE');ensureDialog(root).querySelector('#modal-form').dataset.form='edit-goal-progress';}
+    else if(action==='toggle-goal')run(async()=>{const goal=findGoal(id)||await request(`/api/goals/${encodeURIComponent(id)}`);await request(`/api/goals/${id}`,{method:'PATCH',body:{completed:!goal.completed}});await load();});
+    else if(action==='edit-goal-progress')run(async()=>{const goal=findGoal(id)||await request(`/api/goals/${encodeURIComponent(id)}`);openForm('UPDATE GOAL PROGRESS',`${fieldRow('Current progress','current',goal.current,'number',true,'min="0" step="any" required')}<input type="hidden" name="goal_id" value="${esc(id)}">`,'UPDATE');ensureDialog(root).querySelector('#modal-form').dataset.form='edit-goal-progress';});
     else if(action==='delete-goal')run(async()=>{if(!confirm('Delete this goal and its checklist tasks?'))return;await request(`/api/goals/${id}`,{method:'DELETE'});await load();toast('Goal deleted.');});
-    else if(action==='add-task'){const goal=state.goals.find((item)=>item.id===id);openAddTask(goal);}
+    else if(action==='add-task')run(async()=>{const goal=findGoal(id)||await request(`/api/goals/${encodeURIComponent(id)}`);openAddTask(goal);});
     else if(action==='archive-game')run(async()=>{if(!confirm(`Archive ${state.game.name}? Your data remains saved.`))return;await request(`/api/games/${state.game.id}/archive`,{method:'POST',body:{}});await load();closeModal(ensureDialog(root));toast('Game archived.');});
     else if(action==='restore-game')run(async()=>{await request(`/api/games/${id}/restore`,{method:'POST',body:{}});await load();await openProfile();toast('Game restored.');});
     else if(action==='restore-section')run(async()=>{await request(`/api/sections/${id}/restore`,{method:'POST',body:{}});await load();await openProfile();toast('Section restored.');});

@@ -1,7 +1,9 @@
 import { ensureDialog } from '../modal.js';
 import { esc } from '../utils/formatting.js';
+import { request } from '../api.js';
 
 export function createObjectEditor({ openForm, fieldRow, openTypeForm, toast, state, root }) {
+  const referenceTimers=new WeakMap(),referenceVersions=new WeakMap();
   function openObjectForm(object=null) {
     const type=object?state.types.find((item)=>item.id===object.object_type_id):state.types.find((item)=>item.id===root.querySelector('[data-selected-type]')?.dataset.selectedType)||state.types.find((item)=>!item.archived);
     if(!type){openTypeForm();toast('Create an object type first, then add objects.',true);return;}
@@ -24,7 +26,7 @@ export function createObjectEditor({ openForm, fieldRow, openTypeForm, toast, st
     if(field.field_type==='boolean')return `<div class="form-field"><label for="f-${esc(name)}">${esc(label)}</label><input id="f-${esc(name)}" name="${esc(name)}" type="checkbox" ${value?'checked':''}></div>`;
     if(field.field_type==='long_text')return `<div class="form-field wide"><label for="f-${esc(name)}">${esc(label)}</label><textarea id="f-${esc(name)}" name="${esc(name)}" maxlength="50000">${esc(value??'')}</textarea></div>`;
     if(field.field_type==='select'){const options=field.options||{};return `<div class="form-field"><label for="f-${esc(name)}">${esc(label)}</label><select id="f-${esc(name)}" name="${esc(name)}"><option value="">Choose…</option>${(options.choices||[]).map((choice)=>`<option value="${esc(choice)}" ${choice===value?'selected':''}>${esc(choice)}</option>`).join('')}</select></div>`;}
-    if(field.field_type==='reference'||field.field_type==='references'){const options=field.options||{};const targets=state.objects.filter((item)=>item.id!==object?.id&&(!options.allowed_type_id||item.object_type_id===options.allowed_type_id));const selected=new Set(Array.isArray(value)?value:[value].filter(Boolean));const missing=[...selected].filter((id)=>!targets.some((item)=>item.id===id));return `<div class="form-field ${field.field_type==='references'?'wide':''}"><label for="f-${esc(name)}">${esc(label)}</label><input type="search" data-reference-search="${esc(name)}" aria-label="Search ${esc(label)} references" placeholder="Find an object…"><select id="f-${esc(name)}" name="${esc(name)}" ${field.field_type==='references'?'multiple':''} ${field.field_type==='references'?'size="4"':''}><option value="">${field.field_type==='references'?'Select one or more…':'No reference'}</option>${missing.map((id)=>`<option value="${esc(id)}" selected>${esc(id)} · unavailable (preserved)</option>`).join('')}${targets.map((target)=>`<option value="${esc(target.id)}" ${selected.has(target.id)?'selected':''}>${esc(target.name)} · ${esc(target.type_name)}</option>`).join('')}</select></div>`;}
+    if(field.field_type==='reference'||field.field_type==='references'){const options=field.options||{};const targets=state.objects.filter((item)=>item.id!==object?.id&&(!options.allowed_type_id||item.object_type_id===options.allowed_type_id));const selected=new Set(Array.isArray(value)?value:[value].filter(Boolean));const missing=[...selected].filter((id)=>!targets.some((item)=>item.id===id));return `<div class="form-field ${field.field_type==='references'?'wide':''}"><label for="f-${esc(name)}">${esc(label)}</label><input type="search" data-reference-search="${esc(name)}" data-allowed-type="${esc(options.allowed_type_id||'')}" data-object-id="${esc(object?.id||'')}" aria-label="Search ${esc(label)} references" placeholder="Find an object…"><select id="f-${esc(name)}" name="${esc(name)}" ${field.field_type==='references'?'multiple':''} ${field.field_type==='references'?'size="4"':''}><option value="">${field.field_type==='references'?'Select one or more…':'No reference'}</option>${missing.map((id)=>`<option value="${esc(id)}" selected>${esc(id)} · unavailable (preserved)</option>`).join('')}${targets.map((target)=>`<option value="${esc(target.id)}" ${selected.has(target.id)?'selected':''}>${esc(target.name)} · ${esc(target.type_name)}</option>`).join('')}</select><small data-reference-status role="status">Search all objects in this game, including objects outside the current page.</small></div>`;}
     if(field.field_type==='progress'){const current=value?.current??'';const max=value?.max??'';return `<div class="form-field"><label>${esc(label)}</label><div style="display:flex;gap:6px"><input aria-label="${esc(label)} current" type="number" step="any" name="${esc(name)}__current" data-progress-field="${esc(name)}" value="${esc(current)}" placeholder="Current"><input aria-label="${esc(label)} maximum" type="number" step="any" name="${esc(name)}__max" data-progress-field="${esc(name)}" value="${esc(max)}" placeholder="Maximum"></div></div>`;}
     const htmlType=field.field_type==='date'?'date':field.field_type==='integer'?'number':field.field_type==='decimal'||field.field_type==='percentage'?'number':'text';
     const step=field.field_type==='integer'?'1':field.field_type==='decimal'||field.field_type==='percentage'?'any':null;
@@ -56,10 +58,30 @@ export function createObjectEditor({ openForm, fieldRow, openTypeForm, toast, st
   }
 
   root.addEventListener('input',event=>{
-    if(!event.target.dataset.referenceSearch)return;
-    const select=event.target.closest('.form-field').querySelector('select');
-    const query=event.target.value.toLocaleLowerCase();
-    for(const option of select.options)option.hidden=Boolean(option.value&&!option.selected&&!option.textContent.toLocaleLowerCase().includes(query));
+    const input=event.target;if(!input.matches('[data-reference-search]'))return;
+    clearTimeout(referenceTimers.get(input));
+    const version=(referenceVersions.get(input)||0)+1;referenceVersions.set(input,version);
+    const timer=setTimeout(async()=>{
+      if(!state.game)return;
+      const params=new URLSearchParams({limit:'30',offset:'0',search:input.value||''});
+      if(input.dataset.allowedType)params.set('type_id',input.dataset.allowedType);
+      if(input.dataset.objectId)params.set('exclude_object_id',input.dataset.objectId);
+      const select=input.closest('.form-field').querySelector('select');
+      const selected=[...select.selectedOptions].map(option=>option.value).filter(Boolean);
+      const status=input.closest('.form-field').querySelector('[data-reference-status]');
+      status.textContent='Searching objects…';
+      try{
+        const result=await request(`/api/games/${encodeURIComponent(state.game.id)}/objects?${params}`);
+        if(!input.isConnected||referenceVersions.get(input)!==version)return;
+        const choices=new Map();
+        for(const option of select.options)if(option.value&&selected.includes(option.value))choices.set(option.value,option.textContent);
+        for(const item of result.items||[])choices.set(item.id,`${item.name} · ${item.type_name}`);
+        select.innerHTML=`<option value="">${select.multiple?'Select one or more…':'No reference'}</option>${[...choices].map(([id,label])=>`<option value="${esc(id)}">${esc(label)}</option>`).join('')}`;
+        for(const option of select.options)option.selected=selected.includes(option.value);
+        status.textContent=`${result.total} matching object${result.total===1?'':'s'} found. Search to find objects beyond this page.`;
+      }catch(error){if(input.isConnected&&referenceVersions.get(input)===version)status.textContent=error.message;}
+    },250);
+    referenceTimers.set(input,timer);
   });
 
   return { openObjectForm, renderFieldInput, readValues };

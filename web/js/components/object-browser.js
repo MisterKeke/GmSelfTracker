@@ -1,8 +1,11 @@
 import { request } from '../api.js';
 import { esc, typeLabel, sectionDisplayConfig } from '../utils/formatting.js';
-import { FILTER_OPERATORS, OPERATOR_LABELS, queryObjects } from '../utils/object-query.js';
+import { FILTER_OPERATORS, OPERATOR_LABELS } from '../utils/object-query.js';
 
 export function createObjectBrowser({state,root,render,toast,run}) {
+  const pageSize=50;
+  let queryVersion=0,queryAbort=null,searchTimer=null;
+  const referenceTimers=new WeakMap(),referenceVersions=new WeakMap(),referenceAborts=new WeakMap();
   const currentSection=()=>state.panel==='section'?state.sections.find(item=>item.id===state.sectionId):null;
   const key=section=>`${state.game.id}:${section?.id||'library'}`;
   function getObjectView(section=null) {
@@ -10,7 +13,6 @@ export function createObjectBrowser({state,root,render,toast,run}) {
     if(!state.views.has(id))state.views.set(id,structuredClone(sectionDisplayConfig(section).object_view||{search:'',type_id:'',mode:'all',conditions:[],sort:'name',direction:'asc'}));
     return state.views.get(id);
   }
-  function filterObjects(objects,section=null) { return queryObjects(objects,getObjectView(section)); }
   function renderObjectControls(section=null) {
     const view=getObjectView(section),type=state.types.find(item=>item.id===view.type_id&&!item.archived);
     const fields=(type?.fields||[]).filter(field=>!field.archived);
@@ -26,19 +28,40 @@ export function createObjectBrowser({state,root,render,toast,run}) {
       const many=condition.operator==='one_of',selected=many?(Array.isArray(condition.value)?condition.value:[]):[condition.value];
       return `<label>Option${many?'s':''}<select data-filter-setting="value" ${many?'multiple size="3"':''}>${(field.options?.choices||[]).map(choice=>`<option value="${esc(choice)}" ${selected.includes(choice)?'selected':''}>${esc(choice)}</option>`).join('')}</select></label>`;
     }
-    if(['reference','references'].includes(field.field_type))return `<label>Referenced object<select data-filter-setting="value"><option value="">Choose object</option>${state.objects.filter(object=>!field.options?.allowed_type_id||object.object_type_id===field.options.allowed_type_id).map(object=>`<option value="${esc(object.id)}" ${condition.value===object.id?'selected':''}>${esc(object.name)}</option>`).join('')}</select></label>`;
+    if(['reference','references'].includes(field.field_type))return `<label>Search referenced object<input type="search" data-filter-reference-search="${esc(field.id)}" placeholder="Find an object…"></label><label>Referenced object<select data-filter-setting="value"><option value="">Choose object</option>${condition.value?`<option value="${esc(condition.value)}" selected>${esc(state.objects.find(object=>object.id===condition.value)?.name||condition.value)} · selected</option>`:''}${state.objects.filter(object=>!field.options?.allowed_type_id||object.object_type_id===field.options.allowed_type_id).map(object=>`<option value="${esc(object.id)}" ${condition.value===object.id?'selected':''}>${esc(object.name)}</option>`).join('')}</select></label>`;
     const kind=field.field_type==='date'?'date':['text','long_text'].includes(field.field_type)?'text':'number';
     return `<label>${condition.operator==='between'?'From':'Value'}<input data-filter-setting="value" type="${kind}" ${kind==='number'?'step="any"':''} value="${esc(condition.value??'')}"></label>${condition.operator==='between'?`<label>To<input data-filter-setting="value_to" type="${kind}" ${kind==='number'?'step="any"':''} value="${esc(condition.value_to??'')}"></label>`:''}`;
   }
-  function refreshObjects() {
+  async function refreshObjects(emit=true) {
     const section=currentSection();
-    const objects=section?state.objects.filter(object=>object.section_ids?.includes(section.id)):state.objects;
-    // Rendering only the result area keeps focus and typed input intact.
-    root.dispatchEvent(new CustomEvent('object-query-changed',{detail:{objects,section}}));
+    if(!state.game){state.objects=[];state.objectTotal=0;return;}
+    const version=++queryVersion,gameID=state.game.id;
+    const requestedPanel=state.panel,requestedSectionID=section?.id||'';
+    queryAbort?.abort();queryAbort=new AbortController();
+    const view=getObjectView(section),params=new URLSearchParams({limit:String(pageSize),offset:String(state.objectPage*pageSize),search:view.search||'',type_id:view.type_id||'',sort:view.sort||'name',direction:view.direction||'asc'});
+    if(section)params.set('section_id',section.id);
+    if(view.conditions?.length)params.set('filters',JSON.stringify({mode:view.mode||'all',conditions:view.conditions}));
+    try {
+      const result=await request(`/api/games/${encodeURIComponent(gameID)}/objects?${params}`,{signal:queryAbort.signal});
+      if(version!==queryVersion||state.game?.id!==gameID||(state.panel==='section'?state.sectionId||'':'')!==requestedSectionID||requestedPanel==='section'&&state.panel!=='section')return;
+      state.objectTotal=Number(result?.total)||0;
+      state.gameObjectTotal=Number(result?.game_total)||0;
+      if(state.objectPage>0&&state.objectPage*pageSize>=state.objectTotal){state.objectPage=Math.max(0,Math.ceil(state.objectTotal/pageSize)-1);return refreshObjects(emit);}
+      state.objects=result?.items||[];
+      for(const object of state.objects)state.objectCache?.set(object.id,object);
+      while((state.objectCache?.size||0)>300)state.objectCache.delete(state.objectCache.keys().next().value);
+      state.objectQueryError='';
+      if(emit)root.dispatchEvent(new CustomEvent('object-query-changed',{detail:{objects:state.objects,section,total:state.objectTotal}}));
+    } catch(error) {
+      if(error?.name==='AbortError'||version!==queryVersion)return;
+      state.objectQueryError=error.message;
+      if(emit)root.dispatchEvent(new CustomEvent('object-query-changed',{detail:{objects:state.objects,section,total:state.objectTotal,error:error.message}}));
+    }
   }
   root.addEventListener('input',event=>{
-    if(event.target.matches('[data-view-search]')){getObjectView(currentSection()).search=event.target.value;state.objectPage=0;refreshObjects();}
+    if(event.target.matches('[data-view-search]')){getObjectView(currentSection()).search=event.target.value;state.objectPage=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>refreshObjects(),250);}
     if(event.target.matches('input[data-filter-setting]'))updateCondition(event.target,false);
+    if(event.target.matches('[data-filter-reference-search]'))scheduleReferenceSearch(event.target);
   });
   function updateCondition(input,redraw=true) {
     const view=getObjectView(currentSection()),index=Number(input.closest('[data-filter-index]').dataset.filterIndex),condition=view.conditions[index];
@@ -49,7 +72,7 @@ export function createObjectBrowser({state,root,render,toast,run}) {
     if(setting==='operator') {
       condition.value=input.value==='one_of'?[]:field?.options?.choices?.[0]??'';condition.value_to=null;
     }
-    state.objectPage=0;if(redraw)render();else refreshObjects();
+    state.objectPage=0;if(redraw){render();refreshObjects();}else refreshObjects();
   }
   function resetCondition(condition) {
     const field=state.types.flatMap(type=>type.fields||[]).find(item=>item.id===condition.field_id);
@@ -60,7 +83,7 @@ export function createObjectBrowser({state,root,render,toast,run}) {
     if(input.dataset.viewSetting) {
       const view=getObjectView(currentSection());view[input.dataset.viewSetting]=input.value;
       if(input.dataset.viewSetting==='type_id'){view.conditions=[];view.sort='name';}
-      state.objectPage=0;render();
+      state.objectPage=0;render();refreshObjects();
     }
     if(input.matches('select[data-filter-setting],input[type=date][data-filter-setting]'))updateCondition(input);
   });
@@ -80,5 +103,28 @@ export function createObjectBrowser({state,root,render,toast,run}) {
       await request(`/api/sections/${section.id}`,{method:'PATCH',body:{display_config:config}});section.display_config=config;toast('Section view saved.');
     });
   });
-  return {getObjectView,filterObjects,renderObjectControls};
+  function scheduleReferenceSearch(input){
+    clearTimeout(referenceTimers.get(input));
+    const version=(referenceVersions.get(input)||0)+1;referenceVersions.set(input,version);
+    referenceAborts.get(input)?.abort();
+    const timer=setTimeout(async()=>{
+      const field=state.types.flatMap(type=>type.fields||[]).find(item=>item.id===input.dataset.filterReferenceSearch);
+      const select=input.closest('.object-filter-row')?.querySelector('select[data-filter-setting="value"]');
+      if(!field||!select||!state.game)return;
+      const controller=new AbortController();referenceAborts.set(input,controller);
+      const selected=select.value,params=new URLSearchParams({limit:'30',offset:'0',search:input.value||''});
+      if(field.options?.allowed_type_id)params.set('type_id',field.options.allowed_type_id);
+      try{
+        const result=await request(`/api/games/${encodeURIComponent(state.game.id)}/objects?${params}`,{signal:controller.signal});
+        if(!input.isConnected||referenceVersions.get(input)!==version)return;
+        const options=new Map();
+        for(const option of select.options)if(option.value&&option.selected)options.set(option.value,option.textContent);
+        for(const object of result.items||[])options.set(object.id,`${object.name} · ${object.type_name}`);
+        select.innerHTML=`<option value="">Choose object</option>${[...options].map(([id,label])=>`<option value="${esc(id)}">${esc(label)}</option>`).join('')}`;
+        select.value=selected;
+      }catch(error){if(error?.name!=='AbortError'&&input.isConnected&&referenceVersions.get(input)===version)toast(error.message,true);}
+    },250);
+    referenceTimers.set(input,timer);
+  }
+  return {getObjectView,renderObjectControls,refreshObjects};
 }

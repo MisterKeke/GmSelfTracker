@@ -214,6 +214,19 @@ func (a *API) getAsset(w http.ResponseWriter, r *http.Request) {
 
 // Cleanup never runs while a database cursor or write transaction is open.
 func (a *API) cleanupDeletedAssets(ctx context.Context) {
+	// Uploads are created just before their resource is saved. If the browser
+	// disappears between those requests, expire old, unreferenced uploads after
+	// one day. asset_references includes archived records, so restored data stays
+	// protected. The update and reference check run as one SQLite statement.
+	cutoff := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
+	queuedAt := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.ExecContext(ctx, `UPDATE uploaded_assets SET deleted_at=? WHERE id IN (
+		SELECT a.id FROM uploaded_assets a LEFT JOIN asset_references r ON r.asset_id=a.id
+		WHERE a.deleted_at IS NULL AND a.created_at<? AND r.asset_id IS NULL
+		ORDER BY a.created_at,a.id LIMIT 25
+	)`, queuedAt, cutoff); err != nil {
+		a.logger.Warn("queue stale image cleanup", "error", err)
+	}
 	rows, err := a.db.QueryContext(ctx, `SELECT id FROM uploaded_assets WHERE deleted_at IS NOT NULL ORDER BY deleted_at,id LIMIT 25`)
 	if err != nil {
 		a.logger.Warn("load pending image cleanup", "error", err)

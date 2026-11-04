@@ -28,12 +28,13 @@ type objectSummary struct {
 
 type objectRecord struct {
 	objectSummary
-	GameID        string                     `json:"game_id"`
-	Archived      bool                       `json:"archived"`
-	Fields        []fieldDefinition          `json:"fields"`
-	Values        map[string]json.RawMessage `json:"values"`
-	FormulaErrors map[string]string          `json:"formula_errors,omitempty"`
-	SectionIDs    []string                   `json:"section_ids,omitempty"`
+	GameID          string                     `json:"game_id"`
+	Archived        bool                       `json:"archived"`
+	Fields          []fieldDefinition          `json:"fields"`
+	Values          map[string]json.RawMessage `json:"values"`
+	FormulaErrors   map[string]string          `json:"formula_errors,omitempty"`
+	SectionIDs      []string                   `json:"section_ids,omitempty"`
+	SectionProgress *sectionProgressSummary    `json:"section_progress,omitempty"`
 }
 
 type dbExecutor interface {
@@ -51,36 +52,125 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100, 1, 200)
 	offset := queryInt(r, "offset", 0, 0, 1000000)
 	includeArchived := r.URL.Query().Get("archived") == "true"
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
+	if len(search) > 2000 {
+		writeError(w, http.StatusBadRequest, "invalid_search", "Object search must be 2000 characters or fewer.")
+		return
+	}
+	typeID := r.URL.Query().Get("type_id")
+	sectionID := r.URL.Query().Get("section_id")
+	excludeSectionID := r.URL.Query().Get("exclude_section_id")
+	excludeObjectID := r.URL.Query().Get("exclude_object_id")
+	if sectionID != "" {
+		if _, err := a.loadSection(r, sectionID, false); err != nil {
+			notFoundOrError(w, err, "Section")
+			return
+		}
+		var sameGame int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM sections WHERE id=? AND game_id=? AND archived=0`, sectionID, gameID).Scan(&sameGame); err != nil || sameGame != 1 {
+			writeError(w, http.StatusNotFound, "not_found", "Section not found.")
+			return
+		}
+	}
+	if excludeSectionID != "" {
+		if _, err := a.loadSection(r, excludeSectionID, false); err != nil {
+			notFoundOrError(w, err, "Section")
+			return
+		}
+		var sameGame int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM sections WHERE id=? AND game_id=? AND archived=0`, excludeSectionID, gameID).Scan(&sameGame); err != nil || sameGame != 1 {
+			writeError(w, http.StatusNotFound, "not_found", "Section not found.")
+			return
+		}
+	}
+	sortBy := r.URL.Query().Get("sort")
+	if sortBy == "" {
+		sortBy = "updated_at"
+	}
+	direction := strings.ToLower(r.URL.Query().Get("direction"))
+	if direction == "" {
+		direction = "desc"
+	}
+	filters := struct {
+		Mode       string         `json:"mode"`
+		Conditions []objectFilter `json:"conditions"`
+	}{Mode: "all"}
+	if raw := r.URL.Query().Get("filters"); raw != "" {
+		if len(raw) > 64*1024 || json.Unmarshal([]byte(raw), &filters) != nil {
+			writeError(w, http.StatusBadRequest, "invalid_filters", "Object filters must be a valid JSON object.")
+			return
+		}
+		if filters.Mode == "" {
+			filters.Mode = "all"
+		}
+	}
+	view := objectView{Search: search, TypeID: typeID, Mode: filters.Mode, Sort: sortBy, Direction: direction, Conditions: filters.Conditions}
+	if err := a.validateObjectView(r.Context(), gameID, &view); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
 	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=?`
 	if !includeArchived {
 		query += ` AND o.archived=0 AND t.archived=0`
 	}
 	args := []any{gameID}
-	if typeID := r.URL.Query().Get("type_id"); typeID != "" {
+	if typeID != "" {
 		query += ` AND o.object_type_id=?`
 		args = append(args, typeID)
 	}
-	query += ` ORDER BY o.updated_at DESC,o.id LIMIT ? OFFSET ?`
-	args = append(args, limit, offset)
+	if search != "" {
+		query += ` AND (instr(lower(o.name),lower(?))>0 OR instr(lower(o.description),lower(?))>0 OR instr(lower(t.name),lower(?))>0)`
+		args = append(args, search, search, search)
+	}
+	if sectionID != "" {
+		query += ` AND EXISTS (SELECT 1 FROM section_placements p WHERE p.section_id=? AND p.object_id=o.id)`
+		args = append(args, sectionID)
+	}
+	if excludeSectionID != "" {
+		query += ` AND NOT EXISTS (SELECT 1 FROM section_placements p WHERE p.section_id=? AND p.object_id=o.id)`
+		args = append(args, excludeSectionID)
+	}
+	if excludeObjectID != "" {
+		query += ` AND o.id<>?`
+		args = append(args, excludeObjectID)
+	}
+	baseSort := map[string]string{"name": "o.name", "type_name": "t.name", "created_at": "o.created_at", "updated_at": "o.updated_at"}
+	_, hasBaseSort := baseSort[sortBy]
+	queryInGo := len(view.Conditions) > 0 || !hasBaseSort
+	var total int
+	if !queryInGo {
+		whereStart := strings.Index(query, " WHERE ")
+		if whereStart < 0 {
+			writeError(w, http.StatusInternalServerError, "database_error", "Could not count objects.")
+			return
+		}
+		countQuery := `SELECT COUNT(*) FROM objects o JOIN object_types t ON t.id=o.object_type_id` + query[whereStart:]
+		if err := a.db.QueryRowContext(r.Context(), countQuery, args...).Scan(&total); err != nil {
+			writeError(w, http.StatusInternalServerError, "database_error", "Could not count objects.")
+			return
+		}
+		query += ` ORDER BY ` + baseSort[sortBy] + ` COLLATE NOCASE ` + strings.ToUpper(direction) + `,o.id ASC LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	} else {
+		query += ` ORDER BY o.id ASC`
+	}
 	rows, err := a.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 		return
 	}
-	defer rows.Close()
-	items := make([]objectRecord, 0)
+	baseItems := make([]objectRecord, 0)
 	for rows.Next() {
-		var item objectRecord
-		var archived int
-		if err := rows.Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.CreatedAt, &archived); err != nil {
+		item, scanErr := scanObjectRecord(rows, gameID)
+		if scanErr != nil {
+			rows.Close()
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 			return
 		}
-		item.GameID = gameID
-		item.Archived = archived != 0
-		items = append(items, item)
+		baseItems = append(baseItems, item)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 		return
 	}
@@ -88,11 +178,333 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 		return
 	}
-	if err := a.hydrateObjects(r.Context(), items); err != nil {
-		writeError(w, 500, "database_error", "Could not load object data.")
+	items := make([]objectRecord, 0)
+	if !queryInGo {
+		items = baseItems
+		if err := a.hydrateObjects(r.Context(), items); err != nil {
+			writeError(w, 500, "database_error", "Could not load object data.")
+			return
+		}
+	} else {
+		candidates := make([]objectQueryCandidate, 0)
+		for start := 0; start < len(baseItems); start += 400 {
+			end := start + 400
+			if end > len(baseItems) {
+				end = len(baseItems)
+			}
+			batch := baseItems[start:end]
+			if err := a.hydrateObjects(r.Context(), batch); err != nil {
+				writeError(w, http.StatusInternalServerError, "database_error", "Could not load object data.")
+				return
+			}
+			for i := range batch {
+				item := batch[i]
+				if objectRecordMatches(item, view) {
+					key, ok := objectRecordSortValue(item, view.Sort)
+					item.Fields, item.Values, item.FormulaErrors, item.SectionIDs = nil, nil, nil, nil
+					candidates = append(candidates, objectQueryCandidate{item: item, sortValue: key, sortValid: ok})
+				}
+				baseItems[start+i] = objectRecord{}
+			}
+		}
+		sortObjectCandidates(candidates, view.Direction)
+		total = len(candidates)
+		if offset < total {
+			end := offset + limit
+			if end > total {
+				end = total
+			}
+			for _, candidate := range candidates[offset:end] {
+				items = append(items, candidate.item)
+			}
+		}
+		if err := a.hydrateObjects(r.Context(), items); err != nil {
+			writeError(w, 500, "database_error", "Could not load object data.")
+			return
+		}
+	}
+	if sectionID != "" {
+		if err := a.attachSectionProgress(r.Context(), sectionID, items); err != nil {
+			writeError(w, http.StatusInternalServerError, "progress_error", "Could not calculate section progress.")
+			return
+		}
+	}
+	var gameTotal int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=? AND o.archived=0 AND t.archived=0`, gameID).Scan(&gameTotal); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not count game objects.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total, "game_total": gameTotal, "limit": limit, "offset": offset, "has_more": offset+len(items) < total})
+}
+
+func objectRecordMatches(item objectRecord, view objectView) bool {
+	if view.TypeID != "" && item.ObjectTypeID != view.TypeID {
+		return false
+	}
+	search := strings.ToLower(strings.TrimSpace(view.Search))
+	if search != "" && !strings.Contains(strings.ToLower(item.Name+" "+item.TypeName+" "+item.Description), search) {
+		return false
+	}
+	if len(view.Conditions) == 0 {
+		return true
+	}
+	matched := 0
+	for _, condition := range view.Conditions {
+		if objectFieldMatches(item, condition) {
+			matched++
+		}
+	}
+	if view.Mode == "any" {
+		return matched > 0
+	}
+	return matched == len(view.Conditions)
+}
+
+type objectQueryCandidate struct {
+	item      objectRecord
+	sortValue any
+	sortValid bool
+}
+
+func scanObjectRecord(rows *sql.Rows, gameID string) (objectRecord, error) {
+	var item objectRecord
+	var archived int
+	if err := rows.Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.CreatedAt, &archived); err != nil {
+		return objectRecord{}, err
+	}
+	item.GameID = gameID
+	item.Archived = archived != 0
+	return item, nil
+}
+
+func objectRecordSortValue(item objectRecord, fieldID string) (any, bool) {
+	switch fieldID {
+	case "name":
+		return item.Name, true
+	case "type_name":
+		return item.TypeName, true
+	case "created_at":
+		return item.CreatedAt, true
+	case "updated_at":
+		return item.UpdatedAt, true
+	}
+	for _, field := range item.Fields {
+		if field.ID != fieldID || field.Archived || item.FormulaErrors[fieldID] != "" {
+			continue
+		}
+		raw, ok := item.Values[fieldID]
+		if !ok || string(raw) == "null" {
+			return nil, false
+		}
+		if field.FieldType == "progress" {
+			var progress struct{ Current, Max float64 }
+			if json.Unmarshal(raw, &progress) != nil || progress.Max <= 0 {
+				return nil, false
+			}
+			return progress.Current / progress.Max, true
+		}
+		if field.FieldType == "integer" || field.FieldType == "decimal" || field.FieldType == "percentage" || field.FieldType == "formula" {
+			number, err := numberFromJSON(raw)
+			return number, err == nil
+		}
+		var decoded any
+		if json.Unmarshal(raw, &decoded) != nil {
+			return nil, false
+		}
+		return decoded, true
+	}
+	return nil, false
+}
+
+func sortObjectCandidates(items []objectQueryCandidate, direction string) {
+	order := 1
+	if direction == "desc" {
+		order = -1
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		left, right := items[i], items[j]
+		if left.sortValid != right.sortValid {
+			return left.sortValid
+		}
+		if left.sortValid {
+			comparison := 0
+			switch x := left.sortValue.(type) {
+			case float64:
+				if y, ok := right.sortValue.(float64); ok && x != y {
+					if x < y {
+						comparison = -1
+					} else {
+						comparison = 1
+					}
+				}
+			case bool:
+				if y, ok := right.sortValue.(bool); ok && x != y {
+					if !x {
+						comparison = -1
+					} else {
+						comparison = 1
+					}
+				}
+			case string:
+				if y, ok := right.sortValue.(string); ok {
+					comparison = strings.Compare(strings.ToLower(x), strings.ToLower(y))
+				}
+			}
+			if comparison != 0 {
+				return comparison*order < 0
+			}
+		}
+		return left.item.ID < right.item.ID
+	})
+}
+
+func objectFieldMatches(item objectRecord, condition objectFilter) bool {
+	var field *fieldDefinition
+	for i := range item.Fields {
+		if item.Fields[i].ID == condition.FieldID && !item.Fields[i].Archived {
+			field = &item.Fields[i]
+			break
+		}
+	}
+	if field == nil || item.FormulaErrors[condition.FieldID] != "" {
+		return false
+	}
+	raw, exists := item.Values[condition.FieldID]
+	if !exists || len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var target any
+	if err := json.Unmarshal(condition.Value, &target); err != nil && condition.Operator != "checked" && condition.Operator != "unchecked" && condition.Operator != "completed" && condition.Operator != "not_completed" {
+		return false
+	}
+	switch field.FieldType {
+	case "integer", "decimal", "percentage", "formula":
+		value, err := numericValue(raw)
+		if err != nil {
+			return false
+		}
+		bound, ok := target.(float64)
+		if !ok {
+			return false
+		}
+		switch condition.Operator {
+		case "eq":
+			return value == bound
+		case "ne":
+			return value != bound
+		case "gt":
+			return value > bound
+		case "gte":
+			return value >= bound
+		case "lt":
+			return value < bound
+		case "lte":
+			return value <= bound
+		case "between":
+			upper, err := numberFromJSON(condition.ValueTo)
+			return err == nil && value >= bound && value <= upper
+		}
+	case "progress":
+		var progress struct{ Current, Max float64 }
+		if json.Unmarshal(raw, &progress) != nil || progress.Max <= 0 {
+			return false
+		}
+		percent := progress.Current / progress.Max * 100
+		bound, ok := target.(float64)
+		switch condition.Operator {
+		case "completed":
+			return percent >= 100
+		case "not_completed":
+			return percent < 100
+		case "above":
+			return ok && percent > bound
+		case "below":
+			return ok && percent < bound
+		}
+	case "boolean":
+		var value bool
+		if json.Unmarshal(raw, &value) != nil {
+			return false
+		}
+		return value == (condition.Operator == "checked")
+	case "reference", "references":
+		var ids []string
+		if json.Unmarshal(raw, &ids) != nil {
+			var id string
+			if json.Unmarshal(raw, &id) != nil {
+				return false
+			}
+			ids = []string{id}
+		}
+		want, ok := target.(string)
+		if !ok {
+			return false
+		}
+		found := false
+		for _, id := range ids {
+			if id == want {
+				found = true
+				break
+			}
+		}
+		if condition.Operator == "eq" {
+			return found
+		}
+		return !found
+	case "select":
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return false
+		}
+		if condition.Operator == "one_of" {
+			var options []string
+			if json.Unmarshal(condition.Value, &options) != nil {
+				return false
+			}
+			for _, option := range options {
+				if value == option {
+					return true
+				}
+			}
+			return false
+		}
+		want, ok := target.(string)
+		return ok && (value == want) == (condition.Operator == "eq")
+	case "text", "long_text", "date":
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return false
+		}
+		want, ok := target.(string)
+		if !ok {
+			return false
+		}
+		if field.FieldType == "date" {
+			switch condition.Operator {
+			case "before":
+				return value < want
+			case "after":
+				return value > want
+			case "on":
+				return value == want
+			case "between":
+				var upper string
+				return json.Unmarshal(condition.ValueTo, &upper) == nil && value >= want && value <= upper
+			}
+		}
+		value, want = strings.ToLower(value), strings.ToLower(want)
+		switch condition.Operator {
+		case "eq":
+			return value == want
+		case "contains":
+			return strings.Contains(value, want)
+		case "not_contains":
+			return !strings.Contains(value, want)
+		case "starts_with":
+			return strings.HasPrefix(value, want)
+		}
+	}
+	return false
 }
 
 func (a *API) createObject(w http.ResponseWriter, r *http.Request) {

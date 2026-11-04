@@ -61,7 +61,7 @@ The database and uploads are ignored by Git. Set environment variables before `m
 ## Core concepts
 
 - **Game:** the owner-scoped data boundary.
-- **Section:** a custom, nested view that organizes object references. Sections support cards, lists, tables with selectable fields, checklists backed by a user-defined checkbox field, and progress calculated from a progress field, multiple numeric fields, or linked child objects. Goals can be placed in multiple sections with shared progress.
+- **Section:** a custom, nested view that organizes object references. Sections support cards, lists, tables with selectable fields, checklists backed by a user-defined checkbox field, and progress calculated from a progress field, multiple numeric fields, or linked child objects. Child progress can stay direct for existing configurations or explicitly traverse recursive same-type relationships. Goals can be placed in multiple sections with shared progress.
 - **Object type:** a user-defined schema such as “Character”, “Location”, or “Project”. These names have no special backend meaning.
 - **Field definition:** a typed characteristic attached to an object type. Its type is immutable after creation. Fields can be archived and restored without losing values.
 - **Object:** a game-level record with one object type. Objects are not copied when placed into sections.
@@ -108,17 +108,18 @@ The API uses JSON and authenticated cookies. Main route groups:
 - `/api/goals/*` and `/api/goal-tasks/*` — goal progress and checklist tasks
 - `/api/assets/*` — local image uploads and authenticated image reads
 
-Errors use a JSON `error` object containing a stable code and readable message. Collections support pagination where they can grow most quickly (games and objects).
+Errors use a JSON `error` object containing a stable code and readable message. Object and goal listings support server-side search, filtering, sorting, and pagination with global matching totals.
 
 ## Local features
 
 - **Rules:** Create a goal, choose rules based on object fields, and add up to 20 conditions. Choose all or any. Numeric comparisons, date comparisons, text equality/contains, choices, and checkboxes are supported. Missing or archived objects do not satisfy conditions.
 - **Relationship calculations:** Create a reference field first, then a formula field. Choose the relationship, operation, and a linked numeric field; use `@{related}` in the expression, optionally alongside ordinary `@{field-id}` references. Count needs no numeric target. Missing numeric values are skipped; empty sums/counts are zero, while empty averages/minimums/maximums show an error.
-- **Calculated progress:** Edit a section and select progress view. Choose one progress field, sums of numeric fields from one type (with either maximum fields or a fixed maximum), or sums of linked child progress. Child rollups follow one explicit reference field and read each child's current/maximum field without recursively traversing relationships.
+- **Calculated progress:** Edit a section and select progress view. Choose one progress field, sums of numeric fields from one type (with either maximum fields or a fixed maximum), or linked child progress. Recursive mode is an explicit opt-in, follows one same-type reference field, deduplicates shared leaves by object ID per root, and sums leaf current/maximum values. Parent values are excluded when they have children. Cycles show an error; archived or missing branches are excluded and reported as partial/incomplete.
 - **Image icons:** Game, section, type, and field forms accept icon image uploads. A type image also provides a default picture for its object cards.
 - **Type lifecycle:** Archive or restore a type in Types & Fields. Its objects are hidden from active views while archived; values and placements are preserved.
 - **Goals in sections:** Use “＋ Goal” in a section to place an existing goal. “Remove here” removes only the placement. Goal values remain shared across sections.
-- **Object library:** The Objects tab browses all active objects, including those without section placements, with name/description search, type filters, and 50-object pages. The browser follows API pagination instead of stopping at the first 100 games or objects.
+- **Object library:** The Objects tab browses all active objects, including those without section placements, with name/description search, type filters, custom filters, and 50-object pages. Section views query their placements directly. Object editors, goal conditions, formula previews, and placement dialogs search the server beyond the current page.
+- **Goal library:** Search, status/type filters, sorting, and 20-goal pages are evaluated on the server after current progress is calculated. Condition cards show backend-evaluated values and named fields/objects.
 - **Safer editing:** Object metadata and values save together. Editors preserve literal strings and existing archived references, and guard against duplicate submissions. Clearing a field default sends an explicit clear operation.
 - **Schema changes:** Removing choices checks active/archived objects, defaults, and goal conditions. The field editor offers replacement mappings; changing allowed reference types requires explicit removal of incompatible existing links.
 
@@ -127,7 +128,7 @@ Existing databases receive pending migrations automatically on the next server s
 ## Current limits
 
 - Email, password reset, cloud sync, game-service imports, and multi-user sharing remain outside this local-only application.
-- Relationship aggregation targets ordinary numeric/progress fields, not formulas on other objects. Child progress rollups use directly linked children, not recursive hierarchies.
+- Relationship formula aggregation targets ordinary numeric/progress fields, not formulas on other objects. Recursive section progress is limited to 64 relationship levels and 10,000 visited objects per request. Object custom-field sorting/filtering and goal progress sorting evaluate matching collections in Go, so those operations still use server memory proportional to the candidate set.
 - New animated image uploads are stored as a static first frame. SVG, AVIF, and HEIC uploads are unsupported.
 - Progress view calculations are display settings; they do not overwrite stored object fields.
 
@@ -141,4 +142,4 @@ Run:
 make test
 ```
 
-Tests use temporary SQLite databases and in-process HTTP handlers. Coverage includes migrations, authentication, ownership isolation, CSRF/origin checks, concurrent authentication limiting, shared placements, field validation and lifecycle, formulas, relationships, multi-condition goals, type archiving, and image validation. The latest changes were source-reviewed and formatted; tests and browser checks were intentionally not run at the user’s request.
+Tests use temporary SQLite databases and in-process HTTP handlers. Coverage includes migrations, authentication, ownership isolation, CSRF/origin checks, shared placements, field lifecycle dependencies, formulas, relationships, multi-condition goal evaluation, paginated queries, recursive progress, type archiving, and image cleanup. Run `go test ./...`, `go vet ./...`, and `node --test web/js/tests/*.test.mjs`. The HTTP query benchmark `BenchmarkObjectQueryPage` builds temporary 1,000, 5,000, and 10,000 object datasets; run it with `go test ./internal/httpapi -run '^$' -bench BenchmarkObjectQueryPage -benchtime=1x`.

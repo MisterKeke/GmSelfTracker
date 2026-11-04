@@ -20,18 +20,18 @@ import (
 )
 
 type testEnvironment struct {
-	t       *testing.T
+	t       testing.TB
 	db      *sql.DB
 	handler http.Handler
 }
 type testUser struct {
-	t       *testing.T
+	t       testing.TB
 	handler http.Handler
 	cookie  *http.Cookie
 	csrf    string
 }
 
-func newTestEnvironment(t *testing.T) *testEnvironment {
+func newTestEnvironment(t testing.TB) *testEnvironment {
 	t.Helper()
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "tracker.db"))
 	if err != nil {
@@ -104,7 +104,7 @@ func (u *testUser) expect(method, path string, body any, want int) []byte {
 	}
 	return data
 }
-func decodeMap(t *testing.T, data []byte) map[string]any {
+func decodeMap(t testing.TB, data []byte) map[string]any {
 	t.Helper()
 	var value map[string]any
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -318,6 +318,44 @@ func TestUploadValidationAndOwnership(t *testing.T) {
 	u.expect("DELETE", "/api/assets/"+assetID, nil, http.StatusNoContent)
 	u.expect("GET", "/api/assets/"+assetID, nil, http.StatusNotFound)
 
+}
+
+func TestStaleUnreferencedUploadsAreCleanedWithoutDeletingArchivedReferences(t *testing.T) {
+	e := newTestEnvironment(t)
+	u := e.client()
+	u.register("stale_asset_user")
+	var encodedPNG bytes.Buffer
+	if err := png.Encode(&encodedPNG, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	upload := func() string {
+		t.Helper()
+		status, body := u.multipart("/api/assets", encodedPNG.Bytes(), "pixel.png")
+		if status != http.StatusCreated {
+			t.Fatalf("upload status=%d body=%s", status, body)
+		}
+		return mapString(decodeMap(t, body), "id")
+	}
+	usedID, orphanID := upload(), upload()
+	game := decodeMap(t, u.expect("POST", "/api/games", map[string]any{"name": "Archived image", "cover_image": "/api/assets/" + usedID}, http.StatusCreated))
+	gameID := mapString(game, "id")
+	u.expect("POST", "/api/games/"+gameID+"/archive", map[string]any{}, http.StatusNoContent)
+	if _, err := e.db.Exec(`UPDATE uploaded_assets SET created_at='2000-01-01T00:00:00Z' WHERE id IN (?,?)`, usedID, orphanID); err != nil {
+		t.Fatal(err)
+	}
+	u.expect("GET", "/api/assets", nil, http.StatusOK)
+	var usedCount, orphanCount int
+	if err := e.db.QueryRow(`SELECT COUNT(*) FROM uploaded_assets WHERE id=?`, usedID).Scan(&usedCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.QueryRow(`SELECT COUNT(*) FROM uploaded_assets WHERE id=?`, orphanID).Scan(&orphanCount); err != nil {
+		t.Fatal(err)
+	}
+	if usedCount != 1 || orphanCount != 0 {
+		t.Fatalf("stale cleanup must preserve archived references and remove only unreferenced uploads: used=%d orphan=%d", usedCount, orphanCount)
+	}
+	u.expect("GET", "/api/assets/"+usedID, nil, http.StatusOK)
+	u.expect("GET", "/api/assets/"+orphanID, nil, http.StatusNotFound)
 }
 
 func TestCustomFieldTypesAndNumericGoalProgress(t *testing.T) {

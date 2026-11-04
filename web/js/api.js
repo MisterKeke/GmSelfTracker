@@ -2,6 +2,15 @@ let csrfToken = '';
 
 export function setCSRF(token) { csrfToken = token || ''; }
 
+export class ApiError extends Error {
+  constructor(message, status = 0, code = 'unknown_error') {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 export async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = (options.method || 'GET').toUpperCase();
@@ -14,13 +23,19 @@ export async function request(path, options = {}) {
   let response;
   try {
     response = await fetch(path, { ...options, method, body, headers, credentials: 'same-origin' });
-  } catch {
-    throw new Error('The local server could not be reached. Check that it is still running.');
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    throw new ApiError('The local server could not be reached. Check that it is still running.', 0, 'network_error');
   }
   if (response.status === 204) return null;
   const contentType = response.headers.get('content-type') || '';
-  const payload = contentType.includes('application/json') ? await response.json() : null;
-  if (!response.ok) throw new Error(payload?.error?.message || `Request failed (${response.status}).`);
+  let payload = null;
+  if (contentType.includes('application/json')) {
+    try { payload = await response.json(); }
+    catch { throw new ApiError('The server returned an invalid response.', response.status, 'invalid_response'); }
+  }
+  if (!response.ok) throw new ApiError(payload?.error?.message || `Request failed (${response.status}).`, response.status, payload?.error?.code || 'http_error');
+  if (!contentType.includes('application/json')) throw new ApiError('The server returned an unexpected response.', response.status, 'invalid_response');
   return payload;
 }
 

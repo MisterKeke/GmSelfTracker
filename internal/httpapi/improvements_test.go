@@ -3,6 +3,9 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -172,6 +175,9 @@ func TestGoalRuleEditingAndLegacyTargets(t *testing.T) {
 	if initial.Completed {
 		t.Fatal("ALL completed incorrectly")
 	}
+	if len(initial.ConditionDetails) != 2 || !initial.ConditionDetails[0].Matched || initial.ConditionDetails[0].State != "satisfied" || initial.ConditionDetails[0].ObjectName != "Example" || initial.ConditionDetails[0].FieldName != "Custom value" || initial.ConditionDetails[1].State != "not_satisfied" {
+		t.Fatalf("goal condition details should report names, live values, and status: %#v", initial.ConditionDetails)
+	}
 	data := decodeMap(t, f.u.expect("PATCH", "/api/goals/"+id, map[string]any{"mode": "any"}, 200))
 	if data["completed"] != true {
 		t.Fatal("ANY did not recalculate")
@@ -194,6 +200,22 @@ func TestGoalRuleEditingAndLegacyTargets(t *testing.T) {
 	data = decodeMap(t, f.u.expect("PATCH", "/api/goals/"+legacy, map[string]any{"target": 15}, 200))
 	if data["id"] != legacy || data["completed"] != false {
 		t.Fatal("legacy target update lost identity or calculation")
+	}
+	broken := f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "Broken formula", "field_type": "formula", "options": map[string]any{"expression": "@{" + f.number + "} / 0"}})
+	invalidCondition := makeCondition(1)
+	invalidCondition["field_id"] = broken
+	invalidGoal := f.create(t, "/api/games/"+f.game+"/goals", map[string]any{"title": "Formula status", "goal_type": "field_target", "mode": "all", "conditions": []any{invalidCondition}})
+	foundInvalid := false
+	for _, item := range f.goals(t) {
+		if item.ID == invalidGoal {
+			foundInvalid = true
+			if len(item.ConditionDetails) != 1 || item.ConditionDetails[0].State != "invalid_value" || !strings.Contains(item.ConditionDetails[0].Error, "division by zero") {
+				t.Fatalf("formula failures should be identified in the goal condition details: %#v", item.ConditionDetails)
+			}
+		}
+	}
+	if !foundInvalid {
+		t.Fatal("formula condition goal was not returned")
 	}
 }
 
@@ -279,6 +301,223 @@ func TestSavedObjectViewValidationAndRoundTrip(t *testing.T) {
 	if raw != "10" {
 		t.Fatalf("filter changed object data: %s", raw)
 	}
+}
+
+func TestFieldArchiveBlocksSavedViewDependenciesIncludingArchivedSections(t *testing.T) {
+	f := newImprovementFixture(t)
+	active := f.section(t, "Main Characters", nil)
+	archived := f.section(t, "Old Builds", nil)
+	view := map[string]any{
+		"search":     "",
+		"type_id":    f.typ,
+		"mode":       "all",
+		"sort":       f.number,
+		"direction":  "desc",
+		"conditions": []any{map[string]any{"field_id": f.number, "operator": "gte", "value": 5}},
+	}
+	config := map[string]any{"object_view": view}
+	f.u.expect("PATCH", "/api/sections/"+active, map[string]any{"display_config": config}, 200)
+	f.u.expect("PATCH", "/api/sections/"+archived, map[string]any{"display_config": config}, 200)
+	f.u.expect("DELETE", "/api/sections/"+archived, nil, 204)
+
+	result := decodeMap(t, f.u.expect("POST", "/api/fields/"+f.number+"/archive", map[string]any{}, 409))
+	message := result["error"].(map[string]any)["message"].(string)
+	for _, expected := range []string{"Custom value", "Main Characters: saved object view: filter", "Main Characters: saved object view: sorting", "archived section: Old Builds"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("archive error should identify %q, got %q", expected, message)
+		}
+	}
+
+	// A deliberately invalid foreign-game configuration must not affect this game's field.
+	otherGame := f.create(t, "/api/games", map[string]any{"name": "Separate game"})
+	otherSection := f.create(t, "/api/games/"+otherGame+"/sections", map[string]any{"name": "Foreign section"})
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.db.Exec(`UPDATE sections SET display_config=? WHERE id=?`, string(raw), otherSection); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.db.Exec(`UPDATE sections SET display_config='{}' WHERE id IN (?,?)`, active, archived); err != nil {
+		t.Fatal(err)
+	}
+	f.u.expect("POST", "/api/fields/"+f.number+"/archive", map[string]any{}, 204)
+	f.u.expect("POST", "/api/fields/"+f.number+"/restore", map[string]any{}, 204)
+	object := decodeMap(t, f.u.expect("GET", "/api/objects/"+f.object, nil, 200))
+	if object["values"].(map[string]any)[f.number] != float64(10) {
+		t.Fatalf("field archive and restore should preserve its saved value: %#v", object["values"])
+	}
+}
+
+func TestFieldArchiveBlocksTransitiveFormulaDependencies(t *testing.T) {
+	f := newImprovementFixture(t)
+	first := f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "First formula", "field_type": "formula", "options": map[string]any{"expression": "@{" + f.number + "} + 1"}})
+	f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "Second formula", "field_type": "formula", "options": map[string]any{"expression": "@{" + first + "} + 1"}})
+	result := decodeMap(t, f.u.expect("POST", "/api/fields/"+f.number+"/archive", map[string]any{}, 409))
+	dependencies := result["dependencies"].([]any)
+	if len(dependencies) != 2 {
+		t.Fatalf("expected direct and transitive formula dependencies, got %#v", dependencies)
+	}
+}
+
+func TestObjectQueriesReturnGloballySortedFilteredPagesAndTotals(t *testing.T) {
+	f := newImprovementFixture(t)
+	alpha := f.create(t, "/api/games/"+f.game+"/objects", map[string]any{"name": "Alpha", "object_type_id": f.typ, "values": map[string]any{f.number: 3}})
+	beta := f.create(t, "/api/games/"+f.game+"/objects", map[string]any{"name": "Beta", "object_type_id": f.typ, "values": map[string]any{f.number: 7}})
+	page := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/objects?limit=1&offset=1&sort=name&direction=asc", nil, 200))
+	items := page["items"].([]any)
+	if page["total"] != float64(3) || len(items) != 1 || items[0].(map[string]any)["id"] != beta {
+		t.Fatalf("name sorting must happen before pagination and report the global total: %#v", page)
+	}
+	search := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/objects?search=aLpHa&limit=10", nil, 200))
+	if search["total"] != float64(1) || search["items"].([]any)[0].(map[string]any)["id"] != alpha {
+		t.Fatalf("server search should be case insensitive and complete: %#v", search)
+	}
+	section := f.section(t, "Selected", nil)
+	f.u.expect("POST", "/api/sections/"+section+"/placements", map[string]any{"object_id": beta}, 204)
+	sectionPage := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/objects?section_id="+section+"&limit=20", nil, 200))
+	if sectionPage["total"] != float64(1) || sectionPage["items"].([]any)[0].(map[string]any)["id"] != beta {
+		t.Fatalf("section query should return only shared objects placed there: %#v", sectionPage)
+	}
+	filters, err := json.Marshal(map[string]any{"mode": "all", "conditions": []any{map[string]any{"field_id": f.number, "operator": "gte", "value": 5}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := "/api/games/" + f.game + "/objects?limit=1&type_id=" + url.QueryEscape(f.typ) + "&sort=" + url.QueryEscape(f.number) + "&direction=desc&filters=" + url.QueryEscape(string(filters))
+	filtered := decodeMap(t, f.u.expect("GET", query, nil, 200))
+	if filtered["total"] != float64(2) || filtered["items"].([]any)[0].(map[string]any)["id"] != f.object || filtered["has_more"] != true {
+		t.Fatalf("custom field filtering and sorting should cover the full matching set: %#v", filtered)
+	}
+}
+
+func TestSectionProgressDirectRecursiveDeduplicationCyclesAndArchivedChildren(t *testing.T) {
+	f := newImprovementFixture(t)
+	relation := f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "Children", "field_type": "references", "options": map[string]any{"allowed_type_id": f.typ}})
+	progress := f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "Progress", "field_type": "progress"})
+	create := func(name string, refs []string, current, maximum any) string {
+		t.Helper()
+		values := map[string]any{}
+		if refs != nil {
+			values[relation] = refs
+		}
+		if current != nil {
+			values[progress] = map[string]any{"current": current, "max": maximum}
+		}
+		return f.create(t, "/api/games/"+f.game+"/objects", map[string]any{"name": name, "object_type_id": f.typ, "values": values})
+	}
+	leaf := create("Leaf", nil, 3, 5)
+	branchA := create("Branch A", []string{leaf}, 2, 4)
+	branchB := create("Branch B", []string{leaf}, 1, 4)
+	root := create("Root", []string{branchA, branchB}, nil, nil)
+	deepLeaf := create("Deep leaf", nil, 7, 10)
+	deep4 := create("Depth four", []string{deepLeaf}, 1, 2)
+	deep3 := create("Depth three", []string{deep4}, 1, 2)
+	deep2 := create("Depth two", []string{deep3}, 1, 2)
+	deep1 := create("Depth one", []string{deep2}, 1, 2)
+	deepRoot := create("Deep root", []string{deep1}, nil, nil)
+	emptyRoot := create("Empty root", []string{}, nil, nil)
+	section := f.section(t, "Progress", nil)
+	f.u.expect("POST", "/api/sections/"+section+"/placements", map[string]any{"object_id": root}, 204)
+	f.u.expect("POST", "/api/sections/"+section+"/placements", map[string]any{"object_id": deepRoot}, 204)
+	f.u.expect("POST", "/api/sections/"+section+"/placements", map[string]any{"object_id": emptyRoot}, 204)
+
+	read := func(depth, objectID string) map[string]any {
+		t.Helper()
+		config := map[string]any{"progress_mode": "children", "progress_depth": depth, "progress_relationship_field_id": relation, "progress_child_field_id": progress}
+		f.u.expect("PATCH", "/api/sections/"+section, map[string]any{"display_style": "progress", "display_config": config}, 200)
+		var found map[string]any
+		var lastPage map[string]any
+		for offset := 0; offset < 3 && found == nil; offset++ {
+			lastPage = decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/objects?section_id="+section+"&limit=1&offset="+strconv.Itoa(offset), nil, 200))
+			for _, item := range lastPage["items"].([]any) {
+				if item.(map[string]any)["id"] == objectID {
+					found = item.(map[string]any)
+					break
+				}
+			}
+		}
+		if found == nil {
+			t.Fatalf("section root query returned unexpected page: %#v", lastPage)
+		}
+		return found["section_progress"].(map[string]any)
+	}
+	direct := read("direct", root)
+	if direct["current"] != float64(3) || direct["maximum"] != float64(8) || direct["contributing_objects"] != float64(2) || direct["status"] != "complete" {
+		t.Fatalf("direct mode should sum immediate children: %#v", direct)
+	}
+	recursive := read("recursive", root)
+	if recursive["current"] != float64(3) || recursive["maximum"] != float64(5) || recursive["percentage"] != float64(60) || recursive["contributing_objects"] != float64(1) || recursive["status"] != "complete" {
+		t.Fatalf("recursive mode should count a shared leaf once: %#v", recursive)
+	}
+	deep := read("recursive", deepRoot)
+	if deep["current"] != float64(7) || deep["maximum"] != float64(10) || deep["percentage"] != float64(70) || deep["status"] != "complete" {
+		t.Fatalf("recursive traversal should reach a five-level leaf: %#v", deep)
+	}
+	empty := read("recursive", emptyRoot)
+	if empty["status"] != "incomplete" || empty["percentage"] != float64(0) || empty["maximum"] != float64(0) {
+		t.Fatalf("empty or missing progress must not appear complete: %#v", empty)
+	}
+	f.u.expect("POST", "/api/objects/"+branchA+"/archive", map[string]any{}, 204)
+	partial := read("recursive", root)
+	if partial["status"] != "partial" || len(partial["warnings"].([]any)) == 0 || partial["current"] != float64(3) {
+		t.Fatalf("archived children should be excluded and reported while retaining valid leaves: %#v", partial)
+	}
+	f.u.expect("POST", "/api/objects/"+branchA+"/restore", map[string]any{}, 204)
+	f.u.expect("PATCH", "/api/objects/"+branchB+"/values", map[string]any{"values": map[string]any{relation: []string{leaf, root}}}, 200)
+	cycle := read("recursive", root)
+	if cycle["status"] != "error" || !strings.Contains(strings.Join(anyStrings(cycle["warnings"].([]any)), " "), "Circular references detected") {
+		t.Fatalf("recursive cycles should report the object path: %#v", cycle)
+	}
+}
+
+func TestGoalQueriesFilterSortAndPaginateBeforeReturningResults(t *testing.T) {
+	f := newImprovementFixture(t)
+	create := func(title string, completed bool, kind string) string {
+		t.Helper()
+		body := map[string]any{"title": title, "goal_type": kind}
+		if kind == "manual" {
+			body["completed"] = completed
+		} else if kind == "numeric" {
+			body["target"] = 100
+		}
+		return f.create(t, "/api/games/"+f.game+"/goals", body)
+	}
+	charlie := create("Quest Charlie", false, "manual")
+	create("Quest Alpha", true, "manual")
+	create("Other", false, "numeric")
+	page := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals?search=QUEST&type=manual&status=active&sort=title&direction=asc&limit=1&offset=0", nil, 200))
+	items := page["items"].([]any)
+	if page["total"] != float64(1) || page["game_total"] != float64(3) || len(items) != 1 || items[0].(map[string]any)["title"] != "Quest Charlie" || page["has_more"] != false {
+		t.Fatalf("goal filters, sorting, and global counts should apply before paging: %#v", page)
+	}
+	section := f.section(t, "Only Charlie", nil)
+	f.u.expect("POST", "/api/sections/"+section+"/goals", map[string]any{"goal_id": charlie}, 204)
+	placed := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals?section_id="+section, nil, 200))
+	if placed["total"] != float64(1) || placed["items"].([]any)[0].(map[string]any)["id"] != charlie {
+		t.Fatalf("section goal listing should return its shared placement: %#v", placed)
+	}
+	available := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals?exclude_section_id="+section+"&limit=20", nil, 200))
+	if available["total"] != float64(2) {
+		t.Fatalf("section picker should exclude goals already placed there: %#v", available)
+	}
+	detail := decodeMap(t, f.u.expect("GET", "/api/goals/"+charlie, nil, 200))
+	if detail["id"] != charlie || detail["title"] != "Quest Charlie" {
+		t.Fatalf("single-goal endpoint should load full editor data: %#v", detail)
+	}
+	all := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals", nil, 200))
+	if len(all["items"].([]any)) != 3 {
+		t.Fatalf("legacy unpaged goal listing should remain complete: %#v", all)
+	}
+}
+
+func anyStrings(values []any) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
 }
 
 func TestFormulaPreviewPreservesRelationshipAggregations(t *testing.T) {

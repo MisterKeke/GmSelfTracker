@@ -97,3 +97,43 @@ Browser verification used a separate disposable SQLite database and upload direc
 - Goal types remain immutable. Checklists require at least one task; goal rules and object filters allow at most 20 conditions, matching the existing bounded goal model.
 - Branch and navigation preferences use per-user, local browser storage; saved section query settings use SQLite. Unsaved query changes survive ordinary navigation within the workspace but are not committed until Save section view is used.
 - No full assistive-technology audit or cross-browser/device matrix was performed. Existing reduced-motion and focus styling are retained and extended. No dependency vulnerability scan was run during this task.
+
+## Follow-up: dependency safety, recursive progress, and paged collections
+
+This section records the 2026-11 follow-up. It extends the earlier implementation above; historical descriptions of local-only collection filtering refer to that earlier state.
+
+### Field and upload lifecycle
+
+Field archive checks now run in the same SQLite transaction as the archive update. They parse saved section display configuration and report dependencies from active or archived sections, including object-view filters, sorting, selected fields, checklist fields, and progress calculations. Formula dependency inspection includes transitive formulas and remains scoped to the field's game. The API blocks archive rather than clearing a user's configuration or values. No migration was needed.
+
+An upload performed during a form save is tracked by that operation. If the resource save fails, the frontend requests deletion for each new asset and leaves entered form values available for retry. The server continues to enforce asset references, including archived records, so compensation cannot delete a concurrently reused image. Cleanup errors stay visible; stale unreferenced uploads are queued after 24 hours through existing asset cleanup. If an upload response is lost before the browser receives its asset ID, the age-based queue is the recovery path.
+
+### Object queries
+
+`GET /api/games/{gameID}/objects` accepts `limit`, `offset`, `search`, `type_id`, `section_id`, `exclude_section_id`, `exclude_object_id`, `sort`, `direction`, and a JSON `filters` object. Results include `items`, matching `total`, full active `game_total`, `limit`, `offset`, and `has_more`. Search covers object name, description, and type name case-insensitively. Name, type, creation, and update sorts happen in SQL before pagination. Custom field filtering/sorting supports existing typed field operators, including formulas evaluated by Go; those candidate sets are hydrated in batches and sorted/filtered before slicing, so memory use still grows with the candidate set. Ties use object ID and missing values sort last.
+
+The workspace requests a page at a time, retains a bounded object detail cache, and uses backend search for references, formula examples, goal condition objects, and section placement. Section contents query the placement join directly. Object and goal page requests guard against stale results when the user switches context.
+
+### Goals
+
+`GET /api/games/{gameID}/goals` accepts `limit`, `offset`, `search`, `status`, `type`, `sort`, `direction`, `section_id`, and `exclude_section_id`. Filtering uses server-evaluated completion and progress, then sorting and pagination run before the response. The response includes matching `total`, unfiltered `game_total`, evaluated `completed_total`, and pagination metadata. Search is case-insensitive over title and description. Supported sort keys are title, creation/update time, progress, and completion; ties use stable goal IDs. The unparameterized endpoint remains backward compatible and returns the full list. The workspace loads only a three-goal overview, the current section's placements, or the requested 20-goal page. A single-goal GET supports on-demand editor data. Current progress evaluation retains request-local object/field caches.
+
+For field-target goals, each condition response includes its stable object/field IDs and names, operator, target, current value when available, match result, and a state such as `satisfied`, `not_satisfied`, `missing_value`, `invalid_value`, `field_unavailable`, or `object_unavailable`. The UI displays the server's ALL/ANY rule and per-condition state.
+
+### Recursive linked progress
+
+Section display configuration may opt into `progress_depth: "recursive"` alongside `progress_mode: "children"`, `progress_relationship_field_id`, and `progress_child_field_id`. Existing or absent depth settings use direct-child behavior. Recursive mode follows only the selected relationship and requires it to accept the same object type. Nodes with active children do not contribute their own progress; only unique leaf IDs contribute, summing current and maximum rather than averaging percentages. Shared leaves count once per root. A cycle produces a named path and error status with no percentage. Archived/unavailable descendants and invalid progress values are excluded with warnings; a result with both valid leaves and warnings is marked partial, and no valid maximum is incomplete. Traversal batches relationship/value reads and caps at 64 levels and 10,000 objects. It does not add a geographic or other domain-specific model.
+
+### Verification and performance
+
+`TestObjectQueriesReturnGloballySortedFilteredPagesAndTotals`, `TestGoalQueriesFilterSortAndPaginateBeforeReturningResults`, `TestSectionProgressDirectRecursiveDeduplicationCyclesAndArchivedChildren`, field archive tests, and stale-upload cleanup tests cover the main follow-up paths. JavaScript API, goal-query, display, and section-tree tests remain part of `node --test web/js/tests/*.test.mjs`. `BenchmarkObjectQueryPage` builds isolated temporary datasets of 1,000, 5,000, and 10,000 objects and measures a page read, a name search, and custom-field filter/sort. Run it with:
+
+```text
+go test ./internal/httpapi -run '^$' -bench BenchmarkObjectQueryPage -benchtime=1x
+```
+
+The benchmark reports measured durations and allocations; results depend on the local machine and are not represented as a general speedup claim. The Go handler still evaluates dynamic goal progress before sorting/filtering, and custom-field object queries process the candidate collection in server memory. Normal browser navigation no longer downloads the full object library or full game goal collection.
+
+On a Windows 11 machine with an Intel Core i5-12500H, the latest one-iteration sample was: for 10,000 objects, a 50-item base page took 26.2 ms and allocated 509 KB; a name search took 43.3 ms and allocated 139 KB; custom numeric filter/sort took 155.2 ms and allocated 98.2 MB. At 5,000 objects, custom filter/sort took 75.5 ms and allocated 48.6 MB; at 1,000 it took 14.9 ms and allocated 9.6 MB. These are single-iteration diagnostics, not statistically stable throughput claims. The custom-field path is still the most expensive query and is a clear target for future streaming/value-index work.
+
+The follow-up's real-browser E2E pass could not be completed in this environment. `mingw32-make dev` started successfully with a disposable database, but the computer-use approval layer rejected opening Google Chrome, and the shell sandbox denied a loopback HTTP request. The server was stopped and the temporary database/upload directory was removed. The Go in-process HTTP tests and frontend unit/syntax checks did run; no claim is made that the new flows were visually exercised in a browser.

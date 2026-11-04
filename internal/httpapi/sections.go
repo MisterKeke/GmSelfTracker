@@ -343,6 +343,7 @@ func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, r
 		ChecklistField     string      `json:"checklist_field_id"`
 		ProgressField      string      `json:"progress_field_id"`
 		ProgressMode       string      `json:"progress_mode"`
+		ProgressDepth       string      `json:"progress_depth"`
 		CurrentFields      []string    `json:"progress_current_field_ids"`
 		MaximumFields      []string    `json:"progress_max_field_ids"`
 		Maximum            float64     `json:"progress_maximum"`
@@ -386,6 +387,9 @@ func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, r
 	if config.ProgressMode != "" && config.ProgressMode != "field" && config.ProgressMode != "calculated" && config.ProgressMode != "children" {
 		return errors.New("Choose a supported progress mode.")
 	}
+	if config.ProgressDepth != "" && config.ProgressDepth != "direct" && config.ProgressDepth != "recursive" {
+		return errors.New("Choose direct or recursive linked progress.")
+	}
 	if config.ProgressMode == "calculated" {
 		if len(config.CurrentFields) == 0 || len(config.CurrentFields) > 20 || len(config.MaximumFields) > 20 {
 			return errors.New("Choose 1–20 current fields and up to 20 maximum fields.")
@@ -412,11 +416,21 @@ func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, r
 	}
 	if config.ProgressMode == "children" {
 		var typeID string
-		if err := a.db.QueryRowContext(ctx, `SELECT f.object_type_id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND t.game_id=? AND f.archived=0 AND t.archived=0`, config.RelationshipField, gameID).Scan(&typeID); err != nil {
+		var optionsRaw []byte
+		if err := a.db.QueryRowContext(ctx, `SELECT f.object_type_id,f.options_json FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.id=? AND t.game_id=? AND f.archived=0 AND t.archived=0`, config.RelationshipField, gameID).Scan(&typeID, &optionsRaw); err != nil {
 			return errors.New("Choose a relationship field from this game.")
 		}
 		if err := a.validateAggregation(ctx, typeID, relationshipAggregation{RelationshipFieldID: config.RelationshipField, FieldID: config.ChildProgressField, Operation: "sum"}); err != nil {
 			return err
+		}
+		if config.ProgressDepth == "recursive" {
+			var relationshipOptions struct {
+				AllowedTypeID string `json:"allowed_type_id"`
+			}
+			_ = json.Unmarshal(optionsRaw, &relationshipOptions)
+			if relationshipOptions.AllowedTypeID == "" || relationshipOptions.AllowedTypeID != typeID {
+				return errors.New("Recursive progress requires a relationship field restricted to objects of the same type.")
+			}
 		}
 		kind, err := a.sectionFieldType(ctx, gameID, config.ChildProgressField)
 		if err != nil || kind != "progress" {

@@ -6,27 +6,42 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type goal struct {
-	SectionIDs  []string        `json:"section_ids"`
-	ID          string          `json:"id"`
-	GameID      string          `json:"game_id"`
-	Title       string          `json:"title"`
-	Description string          `json:"description"`
-	GoalType    string          `json:"goal_type"`
-	ObjectID    *string         `json:"object_id"`
-	FieldID     *string         `json:"field_id"`
-	Target      json.RawMessage `json:"target,omitempty"`
-	Current     float64         `json:"current"`
-	Completed   bool            `json:"completed"`
-	Progress    float64         `json:"progress"`
-	Tasks       []goalTask      `json:"tasks,omitempty"`
-	CreatedAt   string          `json:"created_at"`
-	UpdatedAt   string          `json:"updated_at"`
+	SectionIDs       []string              `json:"section_ids"`
+	ID               string                `json:"id"`
+	GameID           string                `json:"game_id"`
+	Title            string                `json:"title"`
+	Description      string                `json:"description"`
+	GoalType         string                `json:"goal_type"`
+	ObjectID         *string               `json:"object_id"`
+	FieldID          *string               `json:"field_id"`
+	Target           json.RawMessage       `json:"target,omitempty"`
+	Current          float64               `json:"current"`
+	Completed        bool                  `json:"completed"`
+	Progress         float64               `json:"progress"`
+	Tasks            []goalTask            `json:"tasks,omitempty"`
+	ConditionDetails []goalConditionStatus `json:"condition_details,omitempty"`
+	CreatedAt        string                `json:"created_at"`
+	UpdatedAt        string                `json:"updated_at"`
+}
+
+type goalConditionStatus struct {
+	ObjectID     string          `json:"object_id"`
+	ObjectName   string          `json:"object_name,omitempty"`
+	FieldID      string          `json:"field_id"`
+	FieldName    string          `json:"field_name,omitempty"`
+	Operator     string          `json:"operator"`
+	Target       json.RawMessage `json:"target"`
+	CurrentValue json.RawMessage `json:"current_value,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	Matched      bool            `json:"matched"`
+	State        string          `json:"state"`
 }
 
 type goalTask struct {
@@ -43,7 +58,34 @@ func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Game")
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,game_id,title,description,goal_type,object_id,field_id,target_json,current_value,completed,created_at,updated_at FROM goals WHERE game_id=? ORDER BY sort_order,created_at`, gameID)
+	sectionID := r.URL.Query().Get("section_id")
+	excludeSectionID := r.URL.Query().Get("exclude_section_id")
+	for _, id := range []string{sectionID, excludeSectionID} {
+		if id == "" {
+			continue
+		}
+		if _, err := a.loadSection(r, id, false); err != nil {
+			notFoundOrError(w, err, "Section")
+			return
+		}
+		var matches int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM sections WHERE id=? AND game_id=? AND archived=0`, id, gameID).Scan(&matches); err != nil || matches != 1 {
+			writeError(w, http.StatusNotFound, "not_found", "Section not found.")
+			return
+		}
+	}
+	query := `SELECT id,game_id,title,description,goal_type,object_id,field_id,target_json,current_value,completed,created_at,updated_at FROM goals WHERE game_id=?`
+	args := []any{gameID}
+	if sectionID != "" {
+		query += ` AND EXISTS (SELECT 1 FROM section_goal_placements p WHERE p.goal_id=goals.id AND p.section_id=?)`
+		args = append(args, sectionID)
+	}
+	if excludeSectionID != "" {
+		query += ` AND NOT EXISTS (SELECT 1 FROM section_goal_placements p WHERE p.goal_id=goals.id AND p.section_id=?)`
+		args = append(args, excludeSectionID)
+	}
+	query += ` ORDER BY sort_order,created_at`
+	rows, err := a.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goals.")
 		return
@@ -90,7 +132,127 @@ func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	gameTotal := 0
+	if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM goals WHERE game_id=?`, gameID).Scan(&gameTotal); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not count goals.")
+		return
+	}
+	completedTotal := 0
+	for _, item := range items {
+		if item.Completed {
+			completedTotal++
+		}
+	}
+	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
+	if len(search) > 2000 {
+		writeError(w, http.StatusBadRequest, "invalid_search", "Goal search must be 2000 characters or fewer.")
+		return
+	}
+	status := r.URL.Query().Get("status")
+	goalType := r.URL.Query().Get("type")
+	sortBy := r.URL.Query().Get("sort")
+	direction := strings.ToLower(r.URL.Query().Get("direction"))
+	if direction == "" && sortBy != "" {
+		direction = "desc"
+	}
+	if status != "" && status != "all" && status != "active" && status != "completed" {
+		writeError(w, http.StatusBadRequest, "invalid_query", "Choose all, active, or completed goal status.")
+		return
+	}
+	if goalType != "" && goalType != "all" && goalType != "manual" && goalType != "checklist" && goalType != "numeric" && goalType != "field_linked" && goalType != "field_target" {
+		writeError(w, http.StatusBadRequest, "invalid_query", "Choose a supported goal type.")
+		return
+	}
+	if sortBy != "" && sortBy != "title" && sortBy != "created_at" && sortBy != "updated_at" && sortBy != "progress" && sortBy != "completed" {
+		writeError(w, http.StatusBadRequest, "invalid_query", "Choose title, created date, updated date, progress, or completion status for goal sorting.")
+		return
+	}
+	if direction != "" && direction != "asc" && direction != "desc" {
+		writeError(w, http.StatusBadRequest, "invalid_query", "Choose ascending or descending goal order.")
+		return
+	}
+	limit := len(items) + 1
+	if r.URL.Query().Has("limit") {
+		limit = queryInt(r, "limit", 20, 1, 100)
+	}
+	offset := queryInt(r, "offset", 0, 0, 1000000)
+	filtered := make([]goal, 0, len(items))
+	for _, item := range items {
+		if search != "" && !strings.Contains(strings.ToLower(item.Title+" "+item.Description), search) {
+			continue
+		}
+		if status == "completed" && !item.Completed || status == "active" && item.Completed {
+			continue
+		}
+		if goalType != "" && goalType != "all" && !(goalType == "field_linked" && item.GoalType == "field_target") && goalType != item.GoalType {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	directionFactor := 1
+	if direction == "desc" {
+		directionFactor = -1
+	}
+	if sortBy != "" {
+		sort.SliceStable(filtered, func(i, j int) bool {
+			left, right := filtered[i], filtered[j]
+			comparison := 0
+			switch sortBy {
+			case "title":
+				comparison = strings.Compare(strings.ToLower(left.Title), strings.ToLower(right.Title))
+			case "created_at":
+				comparison = strings.Compare(left.CreatedAt, right.CreatedAt)
+			case "updated_at":
+				comparison = strings.Compare(left.UpdatedAt, right.UpdatedAt)
+			case "progress":
+				if left.Progress < right.Progress {
+					comparison = -1
+				} else if left.Progress > right.Progress {
+					comparison = 1
+				}
+			case "completed":
+				if !left.Completed && right.Completed {
+					comparison = -1
+				} else if left.Completed && !right.Completed {
+					comparison = 1
+				}
+			}
+			if comparison == 0 {
+				return left.ID < right.ID
+			}
+			return comparison*directionFactor < 0
+		})
+	}
+	total := len(filtered)
+	if offset >= total {
+		filtered = []goal{}
+	} else {
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		filtered = filtered[offset:end]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": filtered, "total": total, "game_total": gameTotal, "completed_total": completedTotal, "limit": limit, "offset": offset, "has_more": offset+len(filtered) < total})
+}
+
+func (a *API) getGoal(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withReadCache(r.Context()))
+	item, err := a.loadGoal(r, r.PathValue("goalID"))
+	if err != nil {
+		notFoundOrError(w, err, "Goal")
+		return
+	}
+	item.SectionIDs, err = a.goalSections(r, item.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goal sections.")
+		return
+	}
+	if err := a.populateGoalProgress(r.Context(), &item); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not calculate goal progress.")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {

@@ -6,7 +6,7 @@ export function sectionDisplayConfig(section){const config=section?.display_conf
 export function readSectionDisplayConfig(form){
   const value=(name)=>form.elements.namedItem(name)?.value||'';
   const selected=(name)=>[...form.querySelectorAll(`input[name="${name}"]:checked`)].map((input)=>input.value);
-  return {visible_field_ids:selected('visible_field_ids'),checklist_field_id:value('checklist_field_id'),progress_field_id:value('progress_field_id'),progress_mode:value('progress_mode')||'field',progress_current_field_ids:selected('progress_current_field_ids'),progress_max_field_ids:selected('progress_max_field_ids'),progress_maximum:Number(value('progress_maximum')||100),progress_relationship_field_id:value('progress_relationship_field_id'),progress_child_field_id:value('progress_child_field_id')};
+  return {visible_field_ids:selected('visible_field_ids'),checklist_field_id:value('checklist_field_id'),progress_field_id:value('progress_field_id'),progress_mode:value('progress_mode')||'field',progress_depth:value('progress_depth')||'direct',progress_current_field_ids:selected('progress_current_field_ids'),progress_max_field_ids:selected('progress_max_field_ids'),progress_maximum:Number(value('progress_maximum')||100),progress_relationship_field_id:value('progress_relationship_field_id'),progress_child_field_id:value('progress_child_field_id')};
 }
 export function typeLabel(type){return FIELD_TYPES.find(([id])=>id===type)?.[1]||type;}
 export function prettyValue(raw,field,objects){

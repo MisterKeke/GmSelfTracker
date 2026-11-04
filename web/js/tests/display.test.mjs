@@ -25,6 +25,27 @@ test('section visible fields remain authoritative and formula errors are visible
   assert.doesNotMatch(html,/class="object-level"/);
   assert.match(card({primary:'amount',errors:{amount:'division by zero'}}),/⚠ division by zero/);
 });
+test('card, list and table use the same configured field order and visibility',()=>{
+  const fields=[field('first','First'),field('second','Second'),field('third','Third')];
+  const object={id:'object',object_type_id:'type',type_name:'Custom type',name:'Example',fields,values:{first:1,second:2,third:3}};
+  const section={display_config:{visible_field_ids:['third','first']}};
+  const views=createObjectViews({state:{types:[{id:'type'}],objects:[object],panel:'section'}});
+  const cardHTML=views.renderObjectCard(object,section);
+  const listHTML=views.renderObjectList([object],section);
+  const tableHTML=views.renderObjectTable([object],section);
+  for(const html of [cardHTML,listHTML,tableHTML]){
+    assert.match(html,/Third/);assert.match(html,/First/);assert.doesNotMatch(html,/Second/);
+    assert.ok(html.indexOf('Third')<html.indexOf('First'));
+  }
+});
+test('list view uses type image fallback and shows formula failures',()=>{
+  const formula=field('formula','Calculated',{field_type:'formula'});
+  const object={id:'object',object_type_id:'type',type_name:'Custom type',name:'Example',fields:[formula],values:{},formula_errors:{formula:'missing input'}};
+  const views=createObjectViews({state:{types:[{id:'type',image:'/api/assets/type-image'}],objects:[object],panel:'section'}});
+  const html=views.renderObjectList([object],{display_config:{}});
+  assert.match(html,/src="\/api\/assets\/type-image"/);
+  assert.match(html,/⚠ missing input/);
+});
 test('object and primary field labels are escaped',()=>{
   assert.match(card({primary:'amount',fields:[field('amount','<script>')]}),/&lt;script&gt;: 42/);
 });

@@ -34,7 +34,7 @@ func (a *API) goalObject(ctx context.Context, gameID, objectID string) (objectRe
 		}
 	}
 	var record objectRecord
-	err := a.db.QueryRowContext(ctx, `SELECT o.id,o.game_id,o.object_type_id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, objectID, gameID).Scan(&record.ID, &record.GameID, &record.ObjectTypeID)
+	err := a.db.QueryRowContext(ctx, `SELECT o.id,o.game_id,o.object_type_id,o.name FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, objectID, gameID).Scan(&record.ID, &record.GameID, &record.ObjectTypeID, &record.Name)
 	if err == nil {
 		record.Fields, err = a.loadFields(ctx, record.ObjectTypeID, false)
 	}
@@ -50,6 +50,20 @@ func (a *API) goalObject(ctx context.Context, gameID, objectID string) (objectRe
 // A page uses three bulk queries for values, relationships and placements, and
 // loads each type's field definitions once instead of once per object.
 func (a *API) hydrateObjects(ctx context.Context, items []objectRecord) error {
+	const batchSize = 400
+	for start := 0; start < len(items); start += batchSize {
+		end := start + batchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		if err := a.hydrateObjectsBatch(ctx, items[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *API) hydrateObjectsBatch(ctx context.Context, items []objectRecord) error {
 	if len(items) == 0 {
 		return nil
 	}

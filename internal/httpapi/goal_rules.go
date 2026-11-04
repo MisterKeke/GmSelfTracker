@@ -48,21 +48,57 @@ func (a *API) validateGoalRule(ctx context.Context, gameID string, rule goalRule
 
 func (a *API) populateRuleProgress(ctx context.Context, item *goal, rule goalRule) error {
 	done := 0
+	item.ConditionDetails = make([]goalConditionStatus, 0, len(rule.Conditions))
+	formulaErrorsByObject := map[string]map[string]string{}
 	for _, condition := range rule.Conditions {
+		status := goalConditionStatus{ObjectID: condition.ObjectID, FieldID: condition.FieldID, Operator: condition.Operator, Target: append(json.RawMessage(nil), condition.Value...), State: "object_unavailable"}
 		record, err := a.goalObject(ctx, item.GameID, condition.ObjectID)
 		if err == sql.ErrNoRows {
+			item.ConditionDetails = append(item.ConditionDetails, status)
 			continue
 		}
 		if err != nil {
 			return err
 		}
+		status.ObjectName = record.Name
 		fields, values := record.Fields, record.Values
+		fieldErrors, cachedErrors := formulaErrorsByObject[record.ID]
+		if !cachedErrors {
+			fieldErrors = formulaErrors(fields, values)
+			formulaErrorsByObject[record.ID] = fieldErrors
+		}
+		fieldFound := false
 		for _, field := range fields {
-			if field.ID == condition.FieldID && conditionMatches(values[field.ID], condition, field.FieldType) {
-				done++
+			if field.ID == condition.FieldID {
+				fieldFound = true
+				status.FieldName = field.Name
+				if raw, ok := values[field.ID]; ok && string(raw) != "null" {
+					status.CurrentValue = append(json.RawMessage(nil), raw...)
+					if formulaError := fieldErrors[field.ID]; formulaError != "" {
+						status.State = "invalid_value"
+						status.Error = formulaError
+					} else if conditionMatches(raw, condition, field.FieldType) {
+						status.Matched = true
+						status.State = "satisfied"
+						done++
+					} else {
+						status.State = "not_satisfied"
+					}
+				} else {
+					if formulaError := fieldErrors[field.ID]; formulaError != "" {
+						status.State = "invalid_value"
+						status.Error = formulaError
+					} else {
+						status.State = "missing_value"
+					}
+				}
 				break
 			}
 		}
+		if !fieldFound {
+			status.State = "field_unavailable"
+		}
+		item.ConditionDetails = append(item.ConditionDetails, status)
 	}
 	item.Current = float64(done)
 	item.Completed = len(rule.Conditions) > 0 && (done == len(rule.Conditions) || rule.Mode == "any" && done > 0)
