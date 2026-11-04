@@ -37,6 +37,7 @@ type goalTask struct {
 }
 
 func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withReadCache(r.Context()))
 	gameID := r.PathValue("gameID")
 	if _, err := a.loadGame(r, gameID, false); err != nil {
 		notFoundOrError(w, err, "Game")
@@ -107,11 +108,30 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		Target      json.RawMessage `json:"target"`
 		Current     float64         `json:"current"`
 		Tasks       []string        `json:"tasks"`
+		TaskDetails []goalTask      `json:"task_details"`
+		Completed   *bool           `json:"completed"`
 		Conditions  []goalCondition `json:"conditions"`
 		Mode        string          `json:"mode"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
+	}
+	if input.Completed != nil && input.GoalType != "manual" {
+		writeError(w, 400, "invalid_goal", "Only manual goals accept a completion state.")
+		return
+	}
+	if input.TaskDetails != nil {
+		if input.GoalType != "checklist" || len(input.Tasks) > 0 {
+			writeError(w, 400, "invalid_tasks", "Use task details only for a checklist, without a separate task list.")
+			return
+		}
+		for _, task := range input.TaskDetails {
+			if task.ID != "" {
+				writeError(w, 400, "invalid_tasks", "New tasks cannot supply existing IDs.")
+				return
+			}
+			input.Tasks = append(input.Tasks, task.Title)
+		}
 	}
 	input.Title = strings.TrimSpace(input.Title)
 	if input.Title == "" || len(input.Title) > 160 {
@@ -211,7 +231,7 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO goals(id,game_id,title,description,goal_type,object_id,field_id,target_json,current_value,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, gameID, input.Title, input.Description, input.GoalType, nullableString(input.ObjectID), nullableString(input.FieldID), target, input.Current, now, now)
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO goals(id,game_id,title,description,goal_type,object_id,field_id,target_json,current_value,completed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, gameID, input.Title, input.Description, input.GoalType, nullableString(input.ObjectID), nullableString(input.FieldID), target, input.Current, boolInt(input.Completed != nil && *input.Completed), now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create goal.")
 		return
@@ -226,7 +246,7 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "create_failed", "Could not create checklist.")
 			return
 		}
-		if _, err := tx.ExecContext(r.Context(), `INSERT INTO goal_tasks(id,goal_id,title,sort_order,created_at) VALUES(?,?,?,?,?)`, taskID, id, title, i, now); err != nil {
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO goal_tasks(id,goal_id,title,completed,sort_order,created_at) VALUES(?,?,?,?,?,?)`, taskID, id, title, boolInt(input.TaskDetails != nil && input.TaskDetails[i].Completed), i, now); err != nil {
 			writeError(w, http.StatusInternalServerError, "create_failed", "Could not create checklist.")
 			return
 		}
@@ -235,68 +255,12 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create goal.")
 		return
 	}
-	item := goal{ID: id, GameID: gameID, Title: input.Title, Description: input.Description, GoalType: input.GoalType, ObjectID: input.ObjectID, FieldID: input.FieldID, Target: input.Target, Current: input.Current, CreatedAt: now, UpdatedAt: now}
+	item := goal{ID: id, GameID: gameID, Title: input.Title, Description: input.Description, GoalType: input.GoalType, ObjectID: input.ObjectID, FieldID: input.FieldID, Target: input.Target, Current: input.Current, Completed: input.Completed != nil && *input.Completed, CreatedAt: now, UpdatedAt: now}
 	if err := a.populateGoalProgress(r.Context(), &item); err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Goal saved but progress could not be calculated.")
 		return
 	}
 	writeJSON(w, http.StatusCreated, item)
-}
-
-func (a *API) updateGoal(w http.ResponseWriter, r *http.Request) {
-	item, err := a.loadGoal(r, r.PathValue("goalID"))
-	if err != nil {
-		notFoundOrError(w, err, "Goal")
-		return
-	}
-	var input struct {
-		Title       *string  `json:"title"`
-		Description *string  `json:"description"`
-		Completed   *bool    `json:"completed"`
-		Current     *float64 `json:"current"`
-	}
-	if !decodeJSON(w, r, &input) {
-		return
-	}
-	if input.Title != nil {
-		item.Title = strings.TrimSpace(*input.Title)
-		if item.Title == "" || len(item.Title) > 160 {
-			writeError(w, http.StatusBadRequest, "invalid_title", "Goal title must be between 1 and 160 characters.")
-			return
-		}
-	}
-	if input.Description != nil {
-		item.Description = *input.Description
-	}
-	if item.GoalType == "field_target" && (input.Completed != nil || input.Current != nil) {
-		writeError(w, http.StatusConflict, "calculated_goal_read_only", "Field target progress is calculated from its object field.")
-		return
-	}
-	if item.GoalType == "checklist" && input.Completed != nil {
-		writeError(w, http.StatusConflict, "checklist_progress_read_only", "Checklist completion is calculated from its tasks.")
-		return
-	}
-	if input.Completed != nil {
-		item.Completed = *input.Completed
-	}
-	if input.Current != nil {
-		if *input.Current < 0 || math.IsNaN(*input.Current) || math.IsInf(*input.Current, 0) {
-			writeError(w, http.StatusBadRequest, "invalid_current", "Current progress must be a nonnegative number.")
-			return
-		}
-		item.Current = *input.Current
-	}
-	item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	_, err = a.db.ExecContext(r.Context(), `UPDATE goals SET title=?,description=?,completed=?,current_value=?,updated_at=? WHERE id=?`, item.Title, item.Description, boolInt(item.Completed), item.Current, item.UpdatedAt, item.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update goal.")
-		return
-	}
-	if err := a.populateGoalProgress(r.Context(), &item); err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", "Could not calculate goal progress.")
-		return
-	}
-	writeJSON(w, http.StatusOK, item)
 }
 
 func (a *API) deleteGoal(w http.ResponseWriter, r *http.Request) {
@@ -420,6 +384,9 @@ func (a *API) loadGoal(r *http.Request, id string) (goal, error) {
 }
 
 func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
+	if ctx.Value(readCacheKey{}) == nil {
+		ctx = withReadCache(ctx)
+	}
 	switch item.GoalType {
 	case "manual":
 		if item.Completed {
@@ -469,22 +436,14 @@ func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
 		if item.ObjectID == nil || item.FieldID == nil {
 			return nil
 		}
-		var record objectRecord
-		err := a.db.QueryRowContext(ctx, `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, *item.ObjectID, item.GameID).Scan(&record.ID, &record.Name, &record.ObjectTypeID, &record.TypeName, &record.Description, &record.Image, &record.UpdatedAt, &record.GameID)
+		record, err := a.goalObject(ctx, item.GameID, *item.ObjectID)
 		if err == sql.ErrNoRows {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		record.Fields, err = a.loadFields(ctx, record.ObjectTypeID, false)
-		if err != nil {
-			return err
-		}
-		values, err := a.objectValues(ctx, a.db, record, record.Fields)
-		if err != nil {
-			return err
-		}
+		values := record.Values
 		raw, ok := values[*item.FieldID]
 		if !ok {
 			return nil

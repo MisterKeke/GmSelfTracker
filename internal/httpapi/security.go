@@ -96,8 +96,18 @@ func (a *API) validateImage(r *http.Request, value string) bool {
 	}
 	if strings.HasPrefix(value, "/api/assets/") {
 		var count int
-		err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM uploaded_assets WHERE id=? AND user_id=?`, strings.TrimPrefix(value, "/api/assets/"), a.currentUser(r).ID).Scan(&count)
+		err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM uploaded_assets WHERE id=? AND user_id=? AND deleted_at IS NULL`, strings.TrimPrefix(value, "/api/assets/"), a.currentUser(r).ID).Scan(&count)
 		return err == nil && count == 1
 	}
 	return true
+}
+
+// Canonicalize same-origin absolute upload URLs before persistence. Other web
+// URLs remain external images and never cause server-side requests.
+func canonicalImageURL(r *http.Request, value string) string {
+	u, err := url.Parse(value)
+	if err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host) && strings.HasPrefix(u.Path, "/api/assets/") && u.RawQuery == "" && u.Fragment == "" && u.User == nil {
+		return u.Path
+	}
+	return value
 }

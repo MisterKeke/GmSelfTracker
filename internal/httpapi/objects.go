@@ -23,6 +23,7 @@ type objectSummary struct {
 	Description  string `json:"description"`
 	Image        string `json:"image"`
 	UpdatedAt    string `json:"updated_at"`
+	CreatedAt    string `json:"created_at"`
 }
 
 type objectRecord struct {
@@ -50,7 +51,7 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100, 1, 200)
 	offset := queryInt(r, "offset", 0, 0, 1000000)
 	includeArchived := r.URL.Query().Get("archived") == "true"
-	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=?`
+	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=?`
 	if !includeArchived {
 		query += ` AND o.archived=0 AND t.archived=0`
 	}
@@ -71,7 +72,7 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var item objectRecord
 		var archived int
-		if err := rows.Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &archived); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.CreatedAt, &archived); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 			return
 		}
@@ -87,23 +88,9 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 		return
 	}
-	for i := range items {
-		items[i].Fields, err = a.loadFields(r.Context(), items[i].ObjectTypeID, false)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database_error", "Could not load fields.")
-			return
-		}
-		items[i].Values, err = a.objectValues(r.Context(), a.db, items[i], items[i].Fields)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database_error", "Could not load object values.")
-			return
-		}
-		items[i].FormulaErrors = formulaErrors(items[i].Fields, items[i].Values)
-		items[i].SectionIDs, err = a.objectSections(r.Context(), items[i].ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database_error", "Could not load object sections.")
-			return
-		}
+	if err := a.hydrateObjects(r.Context(), items); err != nil {
+		writeError(w, 500, "database_error", "Could not load object data.")
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
 }
@@ -130,6 +117,7 @@ func (a *API) createObject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name", "Object name must be between 1 and 160 characters.")
 		return
 	}
+	input.Image = canonicalImageURL(r, input.Image)
 	if !a.validateImage(r, input.Image) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
@@ -181,7 +169,7 @@ func (a *API) createObject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create object.")
 		return
 	}
-	item := objectRecord{objectSummary: objectSummary{ID: id, Name: input.Name, ObjectTypeID: input.ObjectTypeID, Description: input.Description, Image: input.Image, UpdatedAt: now}, GameID: gameID, Fields: fields}
+	item := objectRecord{objectSummary: objectSummary{ID: id, Name: input.Name, ObjectTypeID: input.ObjectTypeID, Description: input.Description, Image: input.Image, UpdatedAt: now, CreatedAt: now}, GameID: gameID, Fields: fields}
 	item.Values, err = a.objectValues(r.Context(), a.db, item, fields)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Object was saved but its values could not be loaded.")
@@ -223,9 +211,10 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name        *string `json:"name"`
-		Description *string `json:"description"`
-		Image       *string `json:"image"`
+		Name        *string                    `json:"name"`
+		Description *string                    `json:"description"`
+		Image       *string                    `json:"image"`
+		Values      map[string]json.RawMessage `json:"values"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -244,13 +233,44 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 		item.Image = *input.Image
 	}
 	item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	item.Image = canonicalImageURL(r, item.Image)
 	if !a.validateImage(r, item.Image) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE objects SET name=?,description=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Image, item.UpdatedAt, item.ID)
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "update_failed", "Could not update object.")
+		return
+	}
+	defer tx.Rollback()
+	if input.Values != nil {
+		fields, err := loadFieldsFrom(r.Context(), tx, item.ObjectTypeID, false)
+		if err != nil {
+			writeError(w, 500, "database_error", "Could not load fields.")
+			return
+		}
+		item.Fields = fields
+		if err := a.saveValues(r.Context(), tx, item.GameID, item.ID, item.ObjectTypeID, fields, input.Values); err != nil {
+			writeValidationError(w, err)
+			return
+		}
+	}
+	_, err = tx.ExecContext(r.Context(), `UPDATE objects SET name=?,description=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Image, item.UpdatedAt, item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
+		return
+	}
+	if input.Values != nil {
+		item.Values, err = a.objectValues(r.Context(), tx, item, item.Fields)
+		if err != nil {
+			writeError(w, 500, "update_failed", "Could not read updated object values.")
+			return
+		}
+		item.FormulaErrors = formulaErrors(item.Fields, item.Values)
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, "update_failed", "Could not update object.")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -351,14 +371,14 @@ func (a *API) deleteObject(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) loadObject(r *http.Request, id string) (objectRecord, error) {
 	var item objectRecord
-	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND o.archived=0 AND t.archived=0 AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.GameID)
+	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.game_id FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND o.archived=0 AND t.archived=0 AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.CreatedAt, &item.GameID)
 	return item, err
 }
 
 func (a *API) loadObjectAny(r *http.Request, id string) (objectRecord, error) {
 	var item objectRecord
 	var archived int
-	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.game_id,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.GameID, &archived)
+	err := a.db.QueryRowContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.game_id,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id JOIN games g ON g.id=o.game_id WHERE o.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.Name, &item.ObjectTypeID, &item.TypeName, &item.Description, &item.Image, &item.UpdatedAt, &item.CreatedAt, &item.GameID, &archived)
 	item.Archived = archived != 0
 	return item, err
 }
@@ -389,8 +409,14 @@ func (a *API) saveValues(ctx context.Context, db dbExecutor, gameID, objectID, t
 			for _, ref := range refs {
 				var targetType string
 				var archived int
-				if err := db.QueryRowContext(ctx, `SELECT o.object_type_id,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND t.archived=0`, ref, gameID).Scan(&targetType, &archived); err != nil || archived != 0 {
-					return validationError{code: "invalid_reference", message: "References must point to active objects in the same game."}
+				if err := db.QueryRowContext(ctx, `SELECT o.object_type_id,CASE WHEN o.archived=1 OR t.archived=1 THEN 1 ELSE 0 END FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=?`, ref, gameID).Scan(&targetType, &archived); err != nil {
+					return validationError{code: "invalid_reference", message: "References must point to objects in the same game."}
+				}
+				if archived != 0 {
+					var existing int
+					if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_relationships WHERE object_id=? AND field_id=? AND referenced_object_id=? AND game_id=?`, objectID, field.ID, ref, gameID).Scan(&existing); err != nil || existing == 0 {
+						return validationError{code: "invalid_reference", message: "New references must point to active objects in the same game."}
+					}
 				}
 				var options map[string]any
 				_ = json.Unmarshal(field.Options, &options)
@@ -587,6 +613,13 @@ func (a *API) objectValues(ctx context.Context, db dbExecutor, item objectRecord
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	if err := a.finishObjectValues(ctx, db, item, fields, values, refs); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func (a *API) finishObjectValues(ctx context.Context, db dbExecutor, item objectRecord, fields []fieldDefinition, values map[string]json.RawMessage, refs map[string][]string) error {
 	for _, field := range fields {
 		if refs, ok := refs[field.ID]; ok {
 			if field.FieldType == "reference" && len(refs) > 0 {
@@ -601,9 +634,9 @@ func (a *API) objectValues(ctx context.Context, db dbExecutor, item objectRecord
 		}
 	}
 	if err := a.calculateFormulas(ctx, db, item, fields, values); err != nil {
-		return nil, err
+		return err
 	}
-	return values, nil
+	return nil
 }
 
 func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, item objectRecord, fields []fieldDefinition, values map[string]json.RawMessage) error {

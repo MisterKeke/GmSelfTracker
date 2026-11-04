@@ -37,11 +37,14 @@ type contextKey string
 
 const sessionContextKey contextKey = "user-session"
 
+var errCredentialsChanged = errors.New("credentials changed during login")
+
 func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	a := &API{db: db, uploadDir: uploadDir, secure: production, logger: logger, limiter: newLoginLimiter(), authSlots: make(chan struct{}, 4), uploadSlots: make(chan struct{}, 2)}
+	a.cleanupDeletedAssets(context.Background())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.health)
 	mux.HandleFunc("POST /api/auth/register", a.limitAuthentication(a.register))
@@ -68,6 +71,8 @@ func New(db *sql.DB, uploadDir string, production bool, logger *slog.Logger) htt
 	protected("POST /api/games/{gameID}/goals", a.createGoal)
 
 	protected("PATCH /api/sections/{sectionID}", a.updateSection)
+	protected("POST /api/sections/{sectionID}/move", a.moveSection)
+	protected("POST /api/object-types/{typeID}/formula-preview", a.previewFormula)
 	protected("DELETE /api/sections/{sectionID}", a.archiveSection)
 	protected("POST /api/sections/{sectionID}/restore", a.restoreSection)
 	protected("GET /api/sections/{sectionID}/placements", a.listPlacements)
@@ -145,7 +150,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (a *API) newSession(ctx context.Context, userID string) (userSession, string, error) {
+func (a *API) newSession(ctx context.Context, userID, expectedHash string) (userSession, string, error) {
 	token, err := randomToken(32)
 	if err != nil {
 		return userSession{}, "", err
@@ -165,6 +170,13 @@ func (a *API) newSession(ctx context.Context, userID string) (userSession, strin
 		return userSession{}, "", err
 	}
 	defer tx.Rollback()
+	var currentHash string
+	if err := tx.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id=?`, userID).Scan(&currentHash); err != nil {
+		return userSession{}, "", err
+	}
+	if !constantTimeEqual(currentHash, expectedHash) {
+		return userSession{}, "", errCredentialsChanged
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at<=?`, now); err != nil {
 		return userSession{}, "", err

@@ -71,6 +71,7 @@ func (a *API) createGame(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name", "Game name must be between 1 and 120 characters.")
 		return
 	}
+	input.CoverImage = canonicalImageURL(r, input.CoverImage)
 	if !a.validateImage(r, input.CoverImage) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
@@ -78,6 +79,7 @@ func (a *API) createGame(w http.ResponseWriter, r *http.Request) {
 	if input.Icon == "" {
 		input.Icon = "🎮"
 	}
+	input.Icon = canonicalImageURL(r, input.Icon)
 	if !a.validIcon(r, input.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
@@ -139,6 +141,7 @@ func (a *API) updateGame(w http.ResponseWriter, r *http.Request) {
 	if input.PersonalNotes != nil {
 		item.PersonalNotes = *input.PersonalNotes
 	}
+	item.CoverImage = canonicalImageURL(r, item.CoverImage)
 	if !a.validateImage(r, item.CoverImage) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
@@ -146,6 +149,7 @@ func (a *API) updateGame(w http.ResponseWriter, r *http.Request) {
 	if input.Icon != nil {
 		item.Icon = *input.Icon
 	}
+	item.Icon = canonicalImageURL(r, item.Icon)
 	if !a.validIcon(r, item.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return

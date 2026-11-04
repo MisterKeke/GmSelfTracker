@@ -101,7 +101,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "registration_failed", "Could not create your account.")
 		return
 	}
-	user, token, err := a.newSession(r.Context(), id)
+	user, token, err := a.newSession(r.Context(), id, string(hash))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_failed", "Your account was created, but a session could not be started.")
 		return
@@ -133,7 +133,11 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
-	user, token, err := a.newSession(r.Context(), id)
+	user, token, err := a.newSession(r.Context(), id, passwordHash)
+	if err == errCredentialsChanged {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Your password changed. Sign in with your current password.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "login_failed", "Could not start a session.")
 		return

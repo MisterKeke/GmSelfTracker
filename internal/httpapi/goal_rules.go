@@ -49,22 +49,14 @@ func (a *API) validateGoalRule(ctx context.Context, gameID string, rule goalRule
 func (a *API) populateRuleProgress(ctx context.Context, item *goal, rule goalRule) error {
 	done := 0
 	for _, condition := range rule.Conditions {
-		var record objectRecord
-		err := a.db.QueryRowContext(ctx, `SELECT o.id,o.game_id,o.object_type_id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, condition.ObjectID, item.GameID).Scan(&record.ID, &record.GameID, &record.ObjectTypeID)
+		record, err := a.goalObject(ctx, item.GameID, condition.ObjectID)
 		if err == sql.ErrNoRows {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		fields, err := a.loadFields(ctx, record.ObjectTypeID, false)
-		if err != nil {
-			return err
-		}
-		values, err := a.objectValues(ctx, a.db, record, fields)
-		if err != nil {
-			return err
-		}
+		fields, values := record.Fields, record.Values
 		for _, field := range fields {
 			if field.ID == condition.FieldID && conditionMatches(values[field.ID], condition, field.FieldType) {
 				done++

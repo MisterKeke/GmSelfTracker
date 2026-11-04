@@ -31,3 +31,11 @@ Origin/media-type handling follows the [OWASP CSRF Prevention Cheat Sheet](https
 ## Prepared regression coverage
 
 `internal/httpapi/security_features_test.go` covers authentication origin/media types, concurrent rate reservations, image URL policy, aggregation, mixed goal conditions, goal placements, mismatched goal fields, and type archive/restore. The existing migration expectation and PNG fixture were updated for the new migration and complete pixel decoding. These tests have not been executed.
+
+## Follow-up implementation
+
+The subsequent logic review identified an old-password login race, editor round-trip corruption, archived relationship loss, duplicate submissions, partial object saves, and ineffective default clearing. These have source fixes described in [review-fixes.md](review-fixes.md). Session creation now verifies the previously checked password hash inside its insertion transaction. Stable asset references and durable cleanup replace URL-string usage scans and filesystem-first deletion. Additional regression tests were prepared but not executed.
+
+## Subsequent workspace verification
+
+The earlier statements about unexecuted tests describe that source-review pass. The configurable-workspace improvement pass subsequently executed the full Go tests, `go vet`, JavaScript regressions, server builds and isolated browser checks. It retained the ownership/CSRF/upload protections and added ownership-checked section moves, read-only formula previews, typed saved-view validation, primary-field validation and transactional goal editing. Details and remaining verification limits are in [improvements.md](improvements.md); this does not constitute a dependency vulnerability scan or a production security certification.

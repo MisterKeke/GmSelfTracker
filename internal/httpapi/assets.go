@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"fmt"
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
@@ -20,7 +22,8 @@ import (
 const maxUploadSize = 5 << 20
 
 func (a *API) listAssets(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,size_bytes FROM uploaded_assets WHERE user_id=? ORDER BY created_at DESC,id`, a.currentUser(r).ID)
+	a.cleanupDeletedAssets(r.Context())
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,size_bytes,deleted_at FROM uploaded_assets WHERE user_id=? ORDER BY created_at DESC,id`, a.currentUser(r).ID)
 	if err != nil {
 		writeError(w, 500, "database_error", "Could not load images.")
 		return
@@ -30,11 +33,12 @@ func (a *API) listAssets(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id string
 		var size int64
-		if err := rows.Scan(&id, &size); err != nil {
+		var deleted sql.NullString
+		if err := rows.Scan(&id, &size, &deleted); err != nil {
 			writeError(w, 500, "database_error", "Could not load images.")
 			return
 		}
-		items = append(items, map[string]any{"id": id, "url": "/api/assets/" + id, "size_bytes": size})
+		items = append(items, map[string]any{"id": id, "url": "/api/assets/" + id, "size_bytes": size, "pending_deletion": deleted.Valid})
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, 500, "database_error", "Could not load images.")
@@ -56,15 +60,8 @@ func (a *API) deleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not_found", "Image not found.")
 		return
 	}
-	url := "/api/assets/" + id
 	var used int
-	// Include archived data: restoring a record must not lose its image.
-	err = tx.QueryRowContext(r.Context(), `SELECT
-	 (SELECT COUNT(*) FROM games WHERE icon=? OR cover_image=?) +
-	 (SELECT COUNT(*) FROM sections WHERE icon=?) +
-	 (SELECT COUNT(*) FROM object_types WHERE icon=? OR image=?) +
-	 (SELECT COUNT(*) FROM field_definitions WHERE icon=?) +
-	 (SELECT COUNT(*) FROM objects WHERE image=?)`, url, url, url, url, url, url, url).Scan(&used)
+	err = tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM asset_references WHERE asset_id=?`, id).Scan(&used)
 	if err != nil {
 		writeError(w, 500, "delete_failed", "Could not check image usage.")
 		return
@@ -73,16 +70,19 @@ func (a *API) deleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "image_in_use", "Replace this image on existing or archived records before deleting it.")
 		return
 	}
-	if err := os.Remove(filepath.Join(a.uploadDir, filepath.Base(filename))); err != nil && !os.IsNotExist(err) {
-		writeError(w, 500, "delete_failed", "Could not delete image file.")
-		return
-	}
-	if _, err := tx.ExecContext(r.Context(), `DELETE FROM uploaded_assets WHERE id=?`, id); err != nil {
-		writeError(w, 500, "delete_failed", "Could not delete image.")
+	if _, err := tx.ExecContext(r.Context(), `UPDATE uploaded_assets SET deleted_at=COALESCE(deleted_at,?) WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id); err != nil {
+		writeError(w, 500, "delete_failed", "Could not schedule image deletion.")
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		writeError(w, 500, "delete_failed", "Could not delete image.")
+		writeError(w, 500, "delete_failed", "Could not schedule image deletion.")
+		return
+	}
+	// File removal happens only after deletion intent commits. Failed cleanup is
+	// retried on startup, uploads, settings reads, and explicit deletion retries.
+	if err := a.cleanupDeletedAsset(r.Context(), id); err != nil {
+		a.logger.Warn("image cleanup pending", "asset_id", id, "error", err)
+		writeJSON(w, http.StatusAccepted, map[string]any{"pending_deletion": true})
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -91,6 +91,7 @@ func (a *API) deleteAsset(w http.ResponseWriter, r *http.Request) {
 func (a *API) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	select {
 	case a.uploadSlots <- struct{}{}:
+		a.cleanupDeletedAssets(r.Context())
 		defer func() { <-a.uploadSlots }()
 	default:
 		w.Header().Set("Retry-After", "5")
@@ -191,7 +192,7 @@ func (a *API) uploadAsset(w http.ResponseWriter, r *http.Request) {
 func (a *API) getAsset(w http.ResponseWriter, r *http.Request) {
 	var filename, mimeType string
 	var owner string
-	err := a.db.QueryRowContext(r.Context(), `SELECT filename,mime_type,user_id FROM uploaded_assets WHERE id=?`, r.PathValue("assetID")).Scan(&filename, &mimeType, &owner)
+	err := a.db.QueryRowContext(r.Context(), `SELECT filename,mime_type,user_id FROM uploaded_assets WHERE id=? AND deleted_at IS NULL`, r.PathValue("assetID")).Scan(&filename, &mimeType, &owner)
 	if err != nil || owner != a.currentUser(r).ID {
 		writeError(w, http.StatusNotFound, "not_found", "Image not found.")
 		return
@@ -209,4 +210,48 @@ func (a *API) getAsset(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, file); err != nil {
 		a.logger.Debug("asset response ended", "error", fmt.Errorf("serve image: %w", err))
 	}
+}
+
+// Cleanup never runs while a database cursor or write transaction is open.
+func (a *API) cleanupDeletedAssets(ctx context.Context) {
+	rows, err := a.db.QueryContext(ctx, `SELECT id FROM uploaded_assets WHERE deleted_at IS NOT NULL ORDER BY deleted_at,id LIMIT 25`)
+	if err != nil {
+		a.logger.Warn("load pending image cleanup", "error", err)
+		return
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		if err := a.cleanupDeletedAsset(ctx, id); err != nil {
+			a.logger.Warn("image cleanup pending", "asset_id", id, "error", err)
+		}
+	}
+}
+
+func (a *API) cleanupDeletedAsset(ctx context.Context, id string) error {
+	var filename string
+	err := a.db.QueryRowContext(ctx, `SELECT filename FROM uploaded_assets WHERE id=? AND deleted_at IS NOT NULL`, id).Scan(&filename)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(a.uploadDir, filepath.Base(filename))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_, err = a.db.ExecContext(ctx, `DELETE FROM uploaded_assets WHERE id=? AND deleted_at IS NOT NULL`, id)
+	return err
 }

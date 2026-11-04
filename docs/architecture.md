@@ -62,10 +62,24 @@ The local database path is `data/gametracker.db`. Upload metadata is relational;
 
 ## Frontend
 
-`web/index.html`, `web/css/app.css`, and `web/js` are embedded into the Go binary. `app.js` starts the session check, `auth.js` renders sign-in and registration, `api.js` handles JSON and CSRF headers, and `workspace.js` renders games and dynamic game data. No build step is required.
+`web/index.html`, `web/css/app.css`, and `web/js` are embedded into the Go binary. `app.js` starts the session check, `auth.js` renders sign-in and registration, and `api.js` handles JSON and CSRF headers. `workspace.js` forwards to `workspace/index.js`, which composes private state, navigation, events, mutation handlers, focused views/components, and editor modules. Dependencies flow toward shared utilities and APIs; callbacks are injected without circular imports or state on `window`. No frontend build step is required.
+
+The section tree uses existing parent/order columns and an atomic move handler. Active children of archived sections remain visible as tree roots without rewriting their parent IDs. Object query settings are stored under the existing section display configuration. Local filtering uses stable field IDs and explicit object-type scope. Formula previews reuse Go schema validation, arithmetic parsing and relationship aggregation without saving temporary inputs. Goal edits update task lists transactionally while retaining stable IDs and placements. Migration 004 adds an optional, type-validated primary display field reference; archived selections remain configured and render a safe fallback. See [improvements.md](improvements.md) for API details and verification.
 
 ## Images and resource bounds
 
 New uploads are fully decoded within dimension/pixel limits, then encoded as static PNG to discard metadata and appended payloads. Two uploads may decode concurrently. Atomic quota enforcement allows 1000 files / 250 MB per account. Assets retain their account ownership when a game is deleted, preserving accounting and images reused across games. Referenced assets, including those used by archived records, cannot be deleted. Icon strings may contain short symbols or validated image URLs. Uploaded image references must belong to the current user.
 
 Migration 002 adds game icons, type archiving, goal placements, and preservation of account-owned asset metadata when deleting games.
+
+## Review fixes and read performance
+
+Object PATCH accepts optional `values` alongside name, description, and image. Validation, value updates, metadata updates, and the resulting value read occur in one transaction. Existing references to archived targets may be retained or removed; adding a new reference to an inactive target remains prohibited.
+
+Object-list hydration batches values, relationships, and placements for a page and loads each type's definitions once. Goal evaluation caches type definitions and fully evaluated objects only within a read request, avoiding repeated reads when conditions or goals share objects. No cross-request cache is retained.
+
+Field option updates run with value migrations in one transaction. `choice_replacements` maps removed choices to new choices for saved values, defaults, and goal targets, including archived objects. `remove_incompatible_references` explicitly authorizes removal of existing links when narrowing allowed types. Dependent aggregation/progress definitions must be updated first if a new allowed type would invalidate them.
+
+Migration 003 adds `asset_references` keyed by stable asset ID and maintained by entity insert/update/delete triggers. It backfills existing local and legacy absolute upload references, including archived records. Source triggers reject new references to deleted or foreign-account uploads. Same-origin absolute upload URLs are canonicalized before persistence.
+
+Image deletion commits `uploaded_assets.deleted_at` before filesystem cleanup. Pending assets cannot be served or referenced. After file removal succeeds (or the file is already absent), cleanup removes metadata. Failures remain durable and visible in settings. Startup, image listing/upload, and explicit deletion retries perform bounded cleanup attempts. Pending files count against the quota until cleanup completes.

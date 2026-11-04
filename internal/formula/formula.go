@@ -10,9 +10,26 @@ import (
 )
 
 type parser struct {
-	input  string
-	pos    int
-	values map[string]float64
+	input      string
+	pos        int
+	values     map[string]float64
+	syntaxOnly bool
+}
+
+// Validate parses the same language as Evaluate without needing example values.
+func Validate(expression string) error {
+	if len(expression) > 4096 {
+		return fmt.Errorf("formula exceeds 4096 bytes")
+	}
+	p := &parser{input: expression, syntaxOnly: true}
+	if _, err := p.expression(); err != nil {
+		return err
+	}
+	p.space()
+	if p.pos != len(p.input) {
+		return fmt.Errorf("unexpected character at position %d", p.pos+1)
+	}
+	return nil
 }
 
 func Evaluate(expression string, values map[string]float64) (float64, error) {
@@ -119,10 +136,12 @@ func (p *parser) term() (float64, error) {
 			if e != nil {
 				return 0, e
 			}
-			if right == 0 {
+			if right == 0 && !p.syntaxOnly {
 				return 0, fmt.Errorf("division by zero")
 			}
-			left /= right
+			if !p.syntaxOnly {
+				left /= right
+			}
 			continue
 		}
 		return left, nil
@@ -175,6 +194,9 @@ func (p *parser) factor() (float64, error) {
 				return 0, fmt.Errorf("field reference is missing a closing brace")
 			}
 			p.pos++
+		}
+		if p.syntaxOnly {
+			return 1, nil
 		}
 		v, ok := p.values[id]
 		if !ok {

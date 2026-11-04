@@ -2,6 +2,19 @@ package formula
 
 import "testing"
 
+func TestValidateUsesExistingArithmeticGrammarWithoutValues(t *testing.T) {
+	for _, expression := range []string{"@{stable-id} + 2 * (3 - 1)", "@legacy / 0", "-@{stable-id}", "@{a} / (@{b} - @{b})"} {
+		if err := Validate(expression); err != nil {
+			t.Fatalf("%s: %v", expression, err)
+		}
+	}
+	for _, expression := range []string{"", "@{field} +", "@{field} ** 2", "sum(@{field})", "@{field", "@{field} + (2"} {
+		if err := Validate(expression); err == nil {
+			t.Fatalf("accepted invalid expression %q", expression)
+		}
+	}
+}
+
 func TestEvaluateArithmeticWithStableFieldIDs(t *testing.T) {
 	value, err := Evaluate("(@{field-one} + 4) * 3 - 6 / 2", map[string]float64{"field-one": 10})
 	if err != nil {

@@ -114,6 +114,7 @@ func (a *API) createSection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	input.Icon = canonicalImageURL(r, input.Icon)
 	if !a.validIcon(r, input.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
@@ -164,6 +165,7 @@ func (a *API) updateSection(w http.ResponseWriter, r *http.Request) {
 	if input.Icon != nil {
 		item.Icon = *input.Icon
 	}
+	item.Icon = canonicalImageURL(r, item.Icon)
 	if !a.validIcon(r, item.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
@@ -250,7 +252,7 @@ func (a *API) listPlacements(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Section")
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.archived,o.updated_at FROM section_placements p JOIN objects o ON o.id=p.object_id JOIN object_types t ON t.id=o.object_type_id WHERE p.section_id=? AND o.archived=0 AND t.archived=0 ORDER BY o.name`, sectionID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.archived,o.updated_at,o.created_at FROM section_placements p JOIN objects o ON o.id=p.object_id JOIN object_types t ON t.id=o.object_type_id WHERE p.section_id=? AND o.archived=0 AND t.archived=0 ORDER BY o.name`, sectionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load section objects.")
 		return
@@ -260,7 +262,7 @@ func (a *API) listPlacements(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var o objectSummary
 		var archived int
-		if err := rows.Scan(&o.ID, &o.Name, &o.ObjectTypeID, &o.TypeName, &o.Description, &o.Image, &archived, &o.UpdatedAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.Name, &o.ObjectTypeID, &o.TypeName, &o.Description, &o.Image, &archived, &o.UpdatedAt, &o.CreatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load section objects.")
 			return
 		}
@@ -336,21 +338,25 @@ func validDisplayStyle(value string) bool {
 
 func (a *API) validateSectionDisplayConfig(ctx context.Context, gameID string, raw json.RawMessage) error {
 	var config struct {
-		VisibleFieldIDs    []string `json:"visible_field_ids"`
-		ChecklistField     string   `json:"checklist_field_id"`
-		ProgressField      string   `json:"progress_field_id"`
-		ProgressMode       string   `json:"progress_mode"`
-		CurrentFields      []string `json:"progress_current_field_ids"`
-		MaximumFields      []string `json:"progress_max_field_ids"`
-		Maximum            float64  `json:"progress_maximum"`
-		RelationshipField  string   `json:"progress_relationship_field_id"`
-		ChildProgressField string   `json:"progress_child_field_id"`
+		ObjectView         *objectView `json:"object_view"`
+		VisibleFieldIDs    []string    `json:"visible_field_ids"`
+		ChecklistField     string      `json:"checklist_field_id"`
+		ProgressField      string      `json:"progress_field_id"`
+		ProgressMode       string      `json:"progress_mode"`
+		CurrentFields      []string    `json:"progress_current_field_ids"`
+		MaximumFields      []string    `json:"progress_max_field_ids"`
+		Maximum            float64     `json:"progress_maximum"`
+		RelationshipField  string      `json:"progress_relationship_field_id"`
+		ChildProgressField string      `json:"progress_child_field_id"`
 	}
 	if len(raw) == 0 {
 		return nil
 	}
 	if err := json.Unmarshal(raw, &config); err != nil {
 		return errors.New("Display configuration must be a JSON object.")
+	}
+	if err := a.validateObjectView(ctx, gameID, config.ObjectView); err != nil {
+		return err
 	}
 	if len(config.VisibleFieldIDs) > 100 {
 		return errors.New("Choose no more than 100 visible fields.")

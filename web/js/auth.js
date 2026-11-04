@@ -1,3 +1,4 @@
+import { esc as escapeHTML } from './utils/formatting.js';
 import { request, setCSRF } from './api.js';
 
 export function renderAuth(root, onAuthenticated) {
@@ -36,9 +37,11 @@ export function renderAuth(root, onAuthenticated) {
     root.querySelector('#auth-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const form = event.currentTarget;
+      if(form.dataset.saving==='true')return;
       const data = Object.fromEntries(new FormData(form));
-      if (registering && data.password !== data.confirm_password) { draw('Those passwords do not match.'); return; }
+      if (registering && data.password !== data.confirm_password) { root.querySelector('.auth-notice').textContent='Those passwords do not match.';return; }
       const submit = form.querySelector('button[type=submit]');
+      form.dataset.saving='true';
       submit.disabled = true;
       submit.textContent = registering ? 'CREATING YOUR ACCOUNT…' : 'OPENING YOUR LIBRARY…';
       try {
@@ -46,11 +49,10 @@ export function renderAuth(root, onAuthenticated) {
         setCSRF(user.csrf_token);
         await onAuthenticated(user);
       } catch (error) {
-        draw(error.message);
+        root.querySelector('.auth-notice').textContent=error.message;
+        delete form.dataset.saving;submit.disabled=false;submit.textContent=registering?'CREATE ACCOUNT ✦':'ENTER YOUR LIBRARY ✦';
       }
     });
   };
   draw();
 }
-
-function escapeHTML(value) { return String(value).replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }

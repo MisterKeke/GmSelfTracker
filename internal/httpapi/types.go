@@ -29,15 +29,16 @@ type fieldDefinition struct {
 }
 
 type objectType struct {
-	Archived    bool              `json:"archived"`
-	ID          string            `json:"id"`
-	GameID      string            `json:"game_id"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Icon        string            `json:"icon"`
-	Image       string            `json:"image"`
-	SortOrder   int               `json:"sort_order"`
-	Fields      []fieldDefinition `json:"fields"`
+	PrimaryDisplayFieldID string            `json:"primary_display_field_id"`
+	Archived              bool              `json:"archived"`
+	ID                    string            `json:"id"`
+	GameID                string            `json:"game_id"`
+	Name                  string            `json:"name"`
+	Description           string            `json:"description"`
+	Icon                  string            `json:"icon"`
+	Image                 string            `json:"image"`
+	SortOrder             int               `json:"sort_order"`
+	Fields                []fieldDefinition `json:"fields"`
 }
 
 type optionalRawMessage struct {
@@ -57,7 +58,7 @@ func (a *API) listObjectTypes(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Game")
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,game_id,name,description,icon,image,sort_order,archived FROM object_types WHERE game_id=? AND (archived=0 OR ?=1) ORDER BY sort_order,name`, gameID, boolInt(r.URL.Query().Get("archived") == "true"))
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,game_id,name,description,icon,image,sort_order,archived,primary_display_field_id FROM object_types WHERE game_id=? AND (archived=0 OR ?=1) ORDER BY sort_order,name`, gameID, boolInt(r.URL.Query().Get("archived") == "true"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load object types.")
 		return
@@ -66,7 +67,7 @@ func (a *API) listObjectTypes(w http.ResponseWriter, r *http.Request) {
 	items := make([]objectType, 0)
 	for rows.Next() {
 		var item objectType
-		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived); err != nil {
+		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived, &item.PrimaryDisplayFieldID); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not load object types.")
 			return
 		}
@@ -113,10 +114,12 @@ func (a *API) createObjectType(w http.ResponseWriter, r *http.Request) {
 	if input.Icon == "" {
 		input.Icon = "◈"
 	}
+	input.Image = canonicalImageURL(r, input.Image)
 	if !a.validateImage(r, input.Image) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
 	}
+	input.Icon = canonicalImageURL(r, input.Icon)
 	if !a.validIcon(r, input.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
@@ -161,10 +164,11 @@ func (a *API) updateObjectType(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name        *string `json:"name"`
-		Description *string `json:"description"`
-		Icon        *string `json:"icon"`
-		Image       *string `json:"image"`
+		PrimaryDisplayFieldID *string `json:"primary_display_field_id"`
+		Name                  *string `json:"name"`
+		Description           *string `json:"description"`
+		Icon                  *string `json:"icon"`
+		Image                 *string `json:"image"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -186,15 +190,27 @@ func (a *API) updateObjectType(w http.ResponseWriter, r *http.Request) {
 	if input.Image != nil {
 		item.Image = *input.Image
 	}
+	if input.PrimaryDisplayFieldID != nil {
+		if *input.PrimaryDisplayFieldID != "" && *input.PrimaryDisplayFieldID != item.PrimaryDisplayFieldID {
+			var valid int
+			if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM field_definitions WHERE id=? AND object_type_id=? AND archived=0`, *input.PrimaryDisplayFieldID, item.ID).Scan(&valid); err != nil || valid != 1 {
+				writeError(w, 400, "invalid_primary_field", "Choose an active field belonging to this object type.")
+				return
+			}
+		}
+		item.PrimaryDisplayFieldID = *input.PrimaryDisplayFieldID
+	}
+	item.Image = canonicalImageURL(r, item.Image)
 	if !a.validateImage(r, item.Image) {
 		writeError(w, 400, "invalid_image", "Choose an image URL or an upload you own.")
 		return
 	}
+	item.Icon = canonicalImageURL(r, item.Icon)
 	if !a.validIcon(r, item.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE object_types SET name=?,description=?,icon=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Icon, item.Image, time.Now().UTC().Format(time.RFC3339), item.ID)
+	_, err = a.db.ExecContext(r.Context(), `UPDATE object_types SET name=?,description=?,icon=?,image=?,primary_display_field_id=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Icon, item.Image, item.PrimaryDisplayFieldID, time.Now().UTC().Format(time.RFC3339), item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object type.")
 		return
@@ -254,6 +270,7 @@ func (a *API) createField(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	input.Icon = canonicalImageURL(r, input.Icon)
 	if !a.validIcon(r, input.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
@@ -294,13 +311,15 @@ func (a *API) updateField(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name         *string            `json:"name"`
-		FieldType    *string            `json:"field_type"`
-		Icon         *string            `json:"icon"`
-		Description  *string            `json:"description"`
-		DefaultValue optionalRawMessage `json:"default_value"`
-		Options      optionalRawMessage `json:"options"`
-		SortOrder    *int               `json:"sort_order"`
+		Name                         *string            `json:"name"`
+		FieldType                    *string            `json:"field_type"`
+		Icon                         *string            `json:"icon"`
+		Description                  *string            `json:"description"`
+		DefaultValue                 optionalRawMessage `json:"default_value"`
+		Options                      optionalRawMessage `json:"options"`
+		SortOrder                    *int               `json:"sort_order"`
+		ChoiceReplacements           map[string]string  `json:"choice_replacements"`
+		RemoveIncompatibleReferences bool               `json:"remove_incompatible_references"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -358,20 +377,35 @@ func (a *API) updateField(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "invalid_default", "Default value must be valid JSON.")
 				return
 			}
-			if err := validateDefaultValue(item.FieldType, item.Options, defaultValue); err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_default", err.Error())
-				return
-			}
 			item.DefaultValue = defaultValue
 		}
 	}
+	item.Icon = canonicalImageURL(r, item.Icon)
 	if !a.validIcon(r, item.Icon) {
 		writeError(w, 400, "invalid_icon", "Choose a symbol or an image you own.")
 		return
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE field_definitions SET name=?,icon=?,description=?,default_json=?,options_json=?,sort_order=?,updated_at=? WHERE id=?`, item.Name, item.Icon, item.Description, nullableJSON(item.DefaultValue), string(item.Options), item.SortOrder, time.Now().UTC().Format(time.RFC3339), item.ID)
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "update_failed", "Could not update field.")
+		return
+	}
+	defer tx.Rollback()
+	if err := migrateFieldOptions(r.Context(), tx, &item, input.ChoiceReplacements, input.RemoveIncompatibleReferences); err != nil {
+		if validation, ok := err.(validationError); ok {
+			writeError(w, http.StatusConflict, validation.code, validation.message)
+		} else {
+			writeError(w, 500, "update_failed", "Could not validate existing field data.")
+		}
+		return
+	}
+	_, err = tx.ExecContext(r.Context(), `UPDATE field_definitions SET name=?,icon=?,description=?,default_json=?,options_json=?,sort_order=?,updated_at=? WHERE id=?`, item.Name, item.Icon, item.Description, nullableJSON(item.DefaultValue), string(item.Options), item.SortOrder, time.Now().UTC().Format(time.RFC3339), item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update field definition.")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, "update_failed", "Could not update field.")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -406,17 +440,32 @@ func (a *API) setFieldArchived(w http.ResponseWriter, r *http.Request, archived 
 
 func (a *API) loadObjectType(r *http.Request, id string) (objectType, error) {
 	var item objectType
-	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image,t.sort_order,t.archived FROM object_types t JOIN games g ON g.id=t.game_id WHERE t.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived)
+	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image,t.sort_order,t.archived,t.primary_display_field_id FROM object_types t JOIN games g ON g.id=t.game_id WHERE t.id=? AND g.user_id=? AND g.archived=0`, id, a.currentUser(r).ID).Scan(&item.ID, &item.GameID, &item.Name, &item.Description, &item.Icon, &item.Image, &item.SortOrder, &item.Archived, &item.PrimaryDisplayFieldID)
 	return item, err
 }
 
 func (a *API) loadFields(ctx context.Context, typeID string, includeArchived bool) ([]fieldDefinition, error) {
+	cache, _ := ctx.Value(readCacheKey{}).(*readCache)
+	key := fieldCacheKey{id: typeID, archived: includeArchived}
+	if cache != nil {
+		if fields, ok := cache.fields[key]; ok {
+			return fields, nil
+		}
+	}
+	fields, err := loadFieldsFrom(ctx, a.db, typeID, includeArchived)
+	if err == nil && cache != nil {
+		cache.fields[key] = fields
+	}
+	return fields, err
+}
+
+func loadFieldsFrom(ctx context.Context, db dbExecutor, typeID string, includeArchived bool) ([]fieldDefinition, error) {
 	query := `SELECT id,object_type_id,name,field_type,icon,description,default_json,options_json,sort_order,archived FROM field_definitions WHERE object_type_id=?`
 	if !includeArchived {
 		query += ` AND archived=0`
 	}
 	query += ` ORDER BY sort_order,name`
-	rows, err := a.db.QueryContext(ctx, query, typeID)
+	rows, err := db.QueryContext(ctx, query, typeID)
 	if err != nil {
 		return nil, err
 	}
@@ -533,6 +582,9 @@ func (a *API) validateFormulaSchema(ctx context.Context, typeID, fieldID string,
 	}
 	if err := json.Unmarshal(options, &config); err != nil {
 		return errText("Formula options must contain an expression.")
+	}
+	if err := formula.Validate(config.Expression); err != nil {
+		return err
 	}
 	if config.Aggregation != nil {
 		if err := a.validateAggregation(ctx, typeID, *config.Aggregation); err != nil {

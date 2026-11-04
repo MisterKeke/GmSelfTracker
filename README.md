@@ -78,13 +78,13 @@ Calculated formulas are read-only and use a small arithmetic grammar. Reference 
 
 ## Authentication and privacy
 
-Passwords use bcrypt. Authenticated sessions use random opaque IDs stored as hashes in SQLite and HttpOnly, SameSite cookies. State-changing API requests require a CSRF token. Private queries check the current user through the game owner. Registration, login, and password changes share an atomic limit of 10 attempts per client IP per five minutes, including successful attempts, with bounded concurrent password hashing. Browser origin checks protect state-changing endpoints, including login; JSON endpoints require `application/json`. API responses are not cached. Session creation removes expired sessions and retains up to 20 sessions per account. Password changes revoke other sessions in the same transaction.
+Passwords use bcrypt. Authenticated sessions use random opaque IDs stored as hashes in SQLite and HttpOnly, SameSite cookies. State-changing API requests require a CSRF token. Private queries check the current user through the game owner. Registration, login, and password changes share an atomic limit of 10 attempts per client IP per five minutes, including successful attempts, with bounded concurrent password hashing. Browser origin checks protect state-changing endpoints, including login; JSON endpoints require `application/json`. API responses are not cached. Session creation removes expired sessions and retains up to 20 sessions per account. Password changes revoke other sessions in the same transaction. Session creation rechecks the verified password hash within its transaction so a concurrent login cannot issue a session using an obsolete password.
 
 This is a local development application. Production deployment still needs an HTTPS reverse proxy, backups, operational monitoring, and a deployment-specific security review.
 
 ## Images
 
-Game covers, game/section/type/field icons, type images, and object images can use local uploads. Uploads accept PNG, JPEG, GIF, WebP, and BMP up to 5 MB. Images are decoded and normalized to PNG; animated formats use their first frame. Both the input and processed image must fit within 5 MB, 6000 × 6000, and 16 million pixels. Each account can store 1000 images or 250 MB; Profile & Settings lists uploads and allows deletion of unused images. Images referenced by active or archived records are protected from deletion.
+Game covers, game/section/type/field icons, type images, and object images can use local uploads. Uploads accept PNG, JPEG, GIF, WebP, and BMP up to 5 MB. Images are decoded and normalized to PNG; animated formats use their first frame. Both the input and processed image must fit within 5 MB, 6000 × 6000, and 16 million pixels. Each account can store 1000 images or 250 MB; Profile & Settings lists uploads and allows deletion of unused images. Failed file cleanup stays queued and can be retried from settings; startup and later image operations also retry cleanup. Images referenced by active or archived records are protected from deletion.
 
 ## Example workflow
 
@@ -118,9 +118,11 @@ Errors use a JSON `error` object containing a stable code and readable message. 
 - **Image icons:** Game, section, type, and field forms accept icon image uploads. A type image also provides a default picture for its object cards.
 - **Type lifecycle:** Archive or restore a type in Types & Fields. Its objects are hidden from active views while archived; values and placements are preserved.
 - **Goals in sections:** Use “＋ Goal” in a section to place an existing goal. “Remove here” removes only the placement. Goal values remain shared across sections.
-- **Larger libraries:** The browser follows API pagination instead of stopping at the first 100 games or objects.
+- **Object library:** The Objects tab browses all active objects, including those without section placements, with name/description search, type filters, and 50-object pages. The browser follows API pagination instead of stopping at the first 100 games or objects.
+- **Safer editing:** Object metadata and values save together. Editors preserve literal strings and existing archived references, and guard against duplicate submissions. Clearing a field default sends an explicit clear operation.
+- **Schema changes:** Removing choices checks active/archived objects, defaults, and goal conditions. The field editor offers replacement mappings; changing allowed reference types requires explicit removal of incompatible existing links.
 
-Existing databases receive migration 002 automatically on the next server start. No migration is applied merely by editing the source.
+Existing databases receive pending migrations automatically on the next server start. Migration 003 adds stable asset-reference tracking and durable image-deletion cleanup. No migration is applied merely by editing the source.
 
 ## Current limits
 
@@ -129,7 +131,7 @@ Existing databases receive migration 002 automatically on the next server start.
 - New animated image uploads are stored as a static first frame. SVG, AVIF, and HEIC uploads are unsupported.
 - Progress view calculations are display settings; they do not overwrite stored object fields.
 
-See [the security review](docs/security-review.md) for findings, fixes, and validation scope.
+See [the review fixes](docs/review-fixes.md) and [the security review](docs/security-review.md) for findings, fixes, and validation scope.
 
 ## Tests
 
