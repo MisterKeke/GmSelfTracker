@@ -148,5 +148,29 @@ export function createGoalEditor({ openForm, fieldRow, toast, state, root }) {
 
   function openAddTask(goal) { openForm('ADD A CHECKLIST TASK',`${fieldRow('Task name','title','','text',true,'required maxlength="160"')}<input type="hidden" name="goal_id" value="${esc(goal.id)}">`,'ADD TASK');ensureDialog(root).querySelector('#modal-form').dataset.form='add-task'; }
 
-  return { openGoalForm, renderGoalSpecific, addConditionRow, updateConditionRow, readGoalConditions, readGoalTasks, openAddTask };
+  async function openGoalDependencies(goal) {
+    const current=await request(`/api/goals/${encodeURIComponent(goal.id)}/dependencies`);
+    const selected=new Set((current.items||[]).map(item=>item.id));
+    const choices=new Map((current.items||[]).map(item=>[item.id,`${item.title}${item.completed?' · complete':''}`]));
+    openForm(`GOAL DEPENDENCIES · ${goal.title}`,`<p class="dialog-help">Choose goals that must be complete before this goal is ready. Dependencies stay within this game; cycles are rejected.</p><div class="form-field wide"><label for="goal-dependency-search">Find prerequisite goals<input id="goal-dependency-search" type="search" data-dependency-search placeholder="Search goals…"><small data-dependency-status role="status">Search this game’s goals. Select several prerequisites.</small></label></div><div class="form-field wide"><label for="goal-dependency-list">Prerequisite goals</label><select id="goal-dependency-list" name="depends_on_ids" multiple size="9">${[...choices].map(([id,label])=>`<option value="${esc(id)}" selected>${esc(label)}</option>`).join('')}</select><small>Use Ctrl or Command to select multiple goals. You can remove a prerequisite by clearing its selection.</small></div><input type="hidden" name="goal_id" value="${esc(goal.id)}">`,'SAVE DEPENDENCIES');
+    const form=ensureDialog(root).querySelector('#modal-form');form.dataset.form='edit-goal-dependencies';
+    const search=form.querySelector('[data-dependency-search]'),select=form.elements.depends_on_ids,status=form.querySelector('[data-dependency-status]');
+    let version=0,timer;
+    const searchGoals=async()=>{
+      const thisVersion=++version,params=new URLSearchParams({limit:'30',offset:'0',search:search.value||'',sort:'title',direction:'asc'});status.textContent='Searching goals…';
+      try{
+        const result=await request(`/api/games/${encodeURIComponent(goal.game_id)}/goals?${params}`);
+        if(!search.isConnected||thisVersion!==version)return;
+        for(const item of result.items||[])if(item.id!==goal.id)choices.set(item.id,`${item.title}${item.completed?' · complete':''}`);
+        const active=[...select.selectedOptions].map(option=>option.value);for(const id of active)selected.add(id);for(const id of [...selected])if(!active.includes(id)&&!choices.has(id))selected.delete(id);
+        select.innerHTML=[...choices].filter(([id])=>id!==goal.id).map(([id,label])=>`<option value="${esc(id)}" ${selected.has(id)?'selected':''}>${esc(label)}</option>`).join('');
+        status.textContent=`${result.total} matching goals found. Complete a prerequisite to unlock this goal.`;
+      }catch(error){if(search.isConnected&&thisVersion===version)status.textContent=error.message;}
+    };
+    search.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(searchGoals,220);});
+    select.addEventListener('change',()=>{selected.clear();for(const option of select.selectedOptions)selected.add(option.value);});
+    searchGoals();
+  }
+
+  return { openGoalForm, renderGoalSpecific, addConditionRow, updateConditionRow, readGoalConditions, readGoalTasks, openAddTask, openGoalDependencies };
 }

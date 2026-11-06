@@ -13,22 +13,25 @@ import (
 )
 
 type goal struct {
-	SectionIDs       []string              `json:"section_ids"`
-	ID               string                `json:"id"`
-	GameID           string                `json:"game_id"`
-	Title            string                `json:"title"`
-	Description      string                `json:"description"`
-	GoalType         string                `json:"goal_type"`
-	ObjectID         *string               `json:"object_id"`
-	FieldID          *string               `json:"field_id"`
-	Target           json.RawMessage       `json:"target,omitempty"`
-	Current          float64               `json:"current"`
-	Completed        bool                  `json:"completed"`
-	Progress         float64               `json:"progress"`
-	Tasks            []goalTask            `json:"tasks,omitempty"`
-	ConditionDetails []goalConditionStatus `json:"condition_details,omitempty"`
-	CreatedAt        string                `json:"created_at"`
-	UpdatedAt        string                `json:"updated_at"`
+	SectionIDs       []string               `json:"section_ids"`
+	ID               string                 `json:"id"`
+	GameID           string                 `json:"game_id"`
+	Title            string                 `json:"title"`
+	Description      string                 `json:"description"`
+	GoalType         string                 `json:"goal_type"`
+	ObjectID         *string                `json:"object_id"`
+	FieldID          *string                `json:"field_id"`
+	Target           json.RawMessage        `json:"target,omitempty"`
+	Current          float64                `json:"current"`
+	Completed        bool                   `json:"completed"`
+	Progress         float64                `json:"progress"`
+	Tasks            []goalTask             `json:"tasks,omitempty"`
+	ConditionDetails []goalConditionStatus  `json:"condition_details,omitempty"`
+	Dependencies     []goalDependencyStatus `json:"dependencies"`
+	Ready            bool                   `json:"ready"`
+	BlockedBy        []string               `json:"blocked_by"`
+	CreatedAt        string                 `json:"created_at"`
+	UpdatedAt        string                 `json:"updated_at"`
 }
 
 type goalConditionStatus struct {
@@ -121,16 +124,25 @@ func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goals.")
 		return
 	}
+	goalIDs := make([]string, len(items))
 	for i := range items {
-		items[i].SectionIDs, err = a.goalSections(r, items[i].ID)
-		if err != nil {
-			writeError(w, 500, "database_error", "Could not load goal sections.")
-			return
-		}
+		goalIDs[i] = items[i].ID
+	}
+	taskSummaries, err := a.goalTaskSummaries(r.Context(), goalIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not summarize checklist progress.")
+		return
+	}
+	cache, _ := r.Context().Value(readCacheKey{}).(*readCache)
+	if cache != nil {
+		cache.goalTaskSummaries = taskSummaries
+	}
+	for i := range items {
 		if err := a.populateGoalProgress(r.Context(), &items[i]); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not calculate goal progress.")
 			return
 		}
+		items[i].ConditionDetails = nil
 	}
 	gameTotal := 0
 	if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM goals WHERE game_id=?`, gameID).Scan(&gameTotal); err != nil {
@@ -233,6 +245,22 @@ func (a *API) listGoals(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = filtered[offset:end]
 	}
+	for i := range filtered {
+		if filtered[i].GoalType == "field_target" {
+			if err := a.populateGoalProgress(r.Context(), &filtered[i]); err != nil {
+				writeError(w, http.StatusInternalServerError, "database_error", "Could not load goal condition details.")
+				return
+			}
+		}
+	}
+	if err := a.populateGoalListDetails(r.Context(), filtered); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goal details.")
+		return
+	}
+	if err := a.populateGoalDependencies(r.Context(), filtered); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goal dependencies.")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": filtered, "total": total, "game_total": gameTotal, "completed_total": completedTotal, "limit": limit, "offset": offset, "has_more": offset+len(filtered) < total})
 }
 
@@ -252,6 +280,12 @@ func (a *API) getGoal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not calculate goal progress.")
 		return
 	}
+	dependencyItems := []goal{item}
+	if err := a.populateGoalDependencies(r.Context(), dependencyItems); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not load goal dependencies.")
+		return
+	}
+	item = dependencyItems[0]
 	writeJSON(w, http.StatusOK, item)
 }
 
@@ -422,6 +456,12 @@ func (a *API) createGoal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Goal saved but progress could not be calculated.")
 		return
 	}
+	dependencyItems := []goal{item}
+	if err := a.populateGoalDependencies(r.Context(), dependencyItems); err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Goal saved but dependencies could not be loaded.")
+		return
+	}
+	item = dependencyItems[0]
 	writeJSON(w, http.StatusCreated, item)
 }
 
@@ -447,8 +487,9 @@ func (a *API) updateGoalTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var task goalTask
+	var goalID string
 	var gameOwner string
-	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.title,t.completed,t.sort_order,g.user_id FROM goal_tasks t JOIN goals gl ON gl.id=t.goal_id JOIN games g ON g.id=gl.game_id WHERE t.id=?`, r.PathValue("taskID")).Scan(&task.ID, &task.Title, &task.Completed, &task.SortOrder, &gameOwner)
+	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.goal_id,t.title,t.completed,t.sort_order,g.user_id FROM goal_tasks t JOIN goals gl ON gl.id=t.goal_id JOIN games g ON g.id=gl.game_id WHERE t.id=?`, r.PathValue("taskID")).Scan(&task.ID, &goalID, &task.Title, &task.Completed, &task.SortOrder, &gameOwner)
 	if err != nil || gameOwner != a.currentUser(r).ID {
 		writeError(w, http.StatusNotFound, "not_found", "Checklist task not found.")
 		return
@@ -461,6 +502,29 @@ func (a *API) updateGoalTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if input.Completed != nil {
+		if *input.Completed && !task.Completed {
+			var remaining int
+			if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM goal_tasks WHERE goal_id=? AND id<>? AND completed=0`, goalID, task.ID).Scan(&remaining); err != nil {
+				writeError(w, http.StatusInternalServerError, "database_error", "Could not validate checklist completion.")
+				return
+			}
+			if remaining == 0 {
+				item, err := a.loadGoal(r, goalID)
+				if err != nil {
+					notFoundOrError(w, err, "Goal")
+					return
+				}
+				ready, blockedBy, err := goalHasReadyPrerequisites(r.Context(), a, item)
+				if err != nil {
+					writeError(w, 500, "database_error", "Could not validate goal readiness.")
+					return
+				}
+				if !ready {
+					writeJSON(w, 409, map[string]any{"error": map[string]string{"code": "goal_blocked", "message": "Complete the prerequisite goals before completing this goal."}, "blocked_by": blockedBy})
+					return
+				}
+			}
+		}
 		task.Completed = *input.Completed
 	}
 	_, err = a.db.ExecContext(r.Context(), `UPDATE goal_tasks SET title=?,completed=? WHERE id=?`, task.Title, boolInt(task.Completed), task.ID)
@@ -564,6 +628,14 @@ func (a *API) populateGoalProgress(ctx context.Context, item *goal) error {
 		item.Progress = math.Min(100, item.Current/target*100)
 		item.Completed = item.Current >= target
 	case "checklist":
+		if cache, _ := ctx.Value(readCacheKey{}).(*readCache); cache != nil && cache.goalTaskSummaries != nil {
+			summary := cache.goalTaskSummaries[item.ID]
+			if summary.total > 0 {
+				item.Progress = float64(summary.completed) / float64(summary.total) * 100
+				item.Completed = summary.completed == summary.total
+			}
+			break
+		}
 		rows, err := a.db.QueryContext(ctx, `SELECT id,title,completed,sort_order FROM goal_tasks WHERE goal_id=? ORDER BY sort_order`, item.ID)
 		if err != nil {
 			return err

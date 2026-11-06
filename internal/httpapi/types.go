@@ -680,6 +680,13 @@ func (a *API) fieldDependencies(ctx context.Context, db dbExecutor, fieldID stri
 	if goalCount > 0 {
 		deps = append(deps, "goal conditions")
 	}
+	var relationshipCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_relationships WHERE field_id=?`, fieldID).Scan(&relationshipCount); err != nil {
+		return nil, err
+	}
+	if relationshipCount > 0 {
+		deps = append(deps, "object relationships")
+	}
 	rows, err := db.QueryContext(ctx, `SELECT f.id,f.name,f.options_json FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id WHERE f.field_type='formula' AND t.game_id=?`, gameID)
 	if err != nil {
 		return nil, err

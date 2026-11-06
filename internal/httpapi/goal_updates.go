@@ -140,6 +140,29 @@ func (a *API) updateGoal(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	willComplete := item.GoalType == "manual" && item.Completed
+	if item.GoalType == "numeric" {
+		if target, e := numberFromJSON(item.Target); e == nil && item.Current >= target {
+			willComplete = true
+		}
+	}
+	if item.GoalType == "checklist" && input.Tasks != nil {
+		willComplete = len(*input.Tasks) > 0
+		for _, task := range *input.Tasks {
+			willComplete = willComplete && task.Completed
+		}
+	}
+	if willComplete {
+		ready, blockedBy, err := goalHasReadyPrerequisites(r.Context(), a, item)
+		if err != nil {
+			writeError(w, 500, "database_error", "Could not validate goal readiness.")
+			return
+		}
+		if !ready {
+			writeJSON(w, 409, map[string]any{"error": map[string]string{"code": "goal_blocked", "message": "Complete the prerequisite goals before completing this goal."}, "blocked_by": blockedBy})
+			return
+		}
+	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, 500, "update_failed", "Could not update goal.")
@@ -220,5 +243,11 @@ func (a *API) updateGoal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "Goal saved but progress could not be calculated.")
 		return
 	}
+	dependencyItems := []goal{item}
+	if err = a.populateGoalDependencies(r.Context(), dependencyItems); err != nil {
+		writeError(w, 500, "database_error", "Goal saved but dependencies could not be loaded.")
+		return
+	}
+	item = dependencyItems[0]
 	writeJSON(w, 200, item)
 }

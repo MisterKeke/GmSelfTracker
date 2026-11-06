@@ -109,34 +109,58 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
-	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=?`
+	fieldTypes, err := a.objectQueryFieldTypes(r.Context(), gameID, view)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not prepare the object query.")
+		return
+	}
+	filterSQL, filterArgs, filtersInSQL := objectSQLFilters(view, fieldTypes)
+	query := `SELECT o.id,o.name,o.object_type_id,t.name,o.description,o.image,o.updated_at,o.created_at,o.archived FROM objects o JOIN object_types t ON t.id=o.object_type_id`
+	baseSort := map[string]string{"name": "o.name", "type_name": "t.name", "created_at": "o.created_at", "updated_at": "o.updated_at"}
+	_, hasBaseSort := baseSort[sortBy]
+	sortJoinArgs := []any{}
+	customSortOrder := ""
+	hasSQLFieldSort := false
+	if !hasBaseSort {
+		if sortFieldType, ok := fieldTypes[sortBy]; ok {
+			if _, sqlSortable := objectSQLSort(sortFieldType); sqlSortable {
+				query += ` LEFT JOIN field_definitions sf ON sf.id=? AND sf.object_type_id=o.object_type_id LEFT JOIN field_values sv ON sv.object_id=o.id AND sv.field_id=sf.id`
+				sortJoinArgs = append(sortJoinArgs, sortBy)
+				customSortOrder, hasSQLFieldSort = customObjectOrder(sortFieldType, direction)
+			}
+		}
+	}
+	query += ` WHERE o.game_id=?`
 	if !includeArchived {
 		query += ` AND o.archived=0 AND t.archived=0`
 	}
-	args := []any{gameID}
+	whereArgs := []any{gameID}
 	if typeID != "" {
 		query += ` AND o.object_type_id=?`
-		args = append(args, typeID)
+		whereArgs = append(whereArgs, typeID)
 	}
 	if search != "" {
 		query += ` AND (instr(lower(o.name),lower(?))>0 OR instr(lower(o.description),lower(?))>0 OR instr(lower(t.name),lower(?))>0)`
-		args = append(args, search, search, search)
+		whereArgs = append(whereArgs, search, search, search)
 	}
 	if sectionID != "" {
 		query += ` AND EXISTS (SELECT 1 FROM section_placements p WHERE p.section_id=? AND p.object_id=o.id)`
-		args = append(args, sectionID)
+		whereArgs = append(whereArgs, sectionID)
 	}
 	if excludeSectionID != "" {
 		query += ` AND NOT EXISTS (SELECT 1 FROM section_placements p WHERE p.section_id=? AND p.object_id=o.id)`
-		args = append(args, excludeSectionID)
+		whereArgs = append(whereArgs, excludeSectionID)
 	}
 	if excludeObjectID != "" {
 		query += ` AND o.id<>?`
-		args = append(args, excludeObjectID)
+		whereArgs = append(whereArgs, excludeObjectID)
 	}
-	baseSort := map[string]string{"name": "o.name", "type_name": "t.name", "created_at": "o.created_at", "updated_at": "o.updated_at"}
-	_, hasBaseSort := baseSort[sortBy]
-	queryInGo := len(view.Conditions) > 0 || !hasBaseSort
+	if filtersInSQL && filterSQL != "" {
+		query += ` AND ` + filterSQL
+		whereArgs = append(whereArgs, filterArgs...)
+	}
+	queryInGo := (len(view.Conditions) > 0 && !filtersInSQL) || (!hasBaseSort && !hasSQLFieldSort)
+	queryArgs := append(append([]any(nil), sortJoinArgs...), whereArgs...)
 	var total int
 	if !queryInGo {
 		whereStart := strings.Index(query, " WHERE ")
@@ -145,16 +169,21 @@ func (a *API) listObjects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		countQuery := `SELECT COUNT(*) FROM objects o JOIN object_types t ON t.id=o.object_type_id` + query[whereStart:]
-		if err := a.db.QueryRowContext(r.Context(), countQuery, args...).Scan(&total); err != nil {
+		if err := a.db.QueryRowContext(r.Context(), countQuery, whereArgs...).Scan(&total); err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Could not count objects.")
 			return
 		}
-		query += ` ORDER BY ` + baseSort[sortBy] + ` COLLATE NOCASE ` + strings.ToUpper(direction) + `,o.id ASC LIMIT ? OFFSET ?`
-		args = append(args, limit, offset)
+		if hasBaseSort {
+			query += ` ORDER BY ` + baseSort[sortBy] + ` COLLATE NOCASE ` + strings.ToUpper(direction) + `,o.id ASC`
+		} else {
+			query += ` ORDER BY ` + customSortOrder
+		}
+		query += ` LIMIT ? OFFSET ?`
+		queryArgs = append(queryArgs, limit, offset)
 	} else {
 		query += ` ORDER BY o.id ASC`
 	}
-	rows, err := a.db.QueryContext(r.Context(), query, args...)
+	rows, err := a.db.QueryContext(r.Context(), query, queryArgs...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Could not load objects.")
 		return
@@ -577,14 +606,18 @@ func (a *API) createObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create object.")
+	item := objectRecord{objectSummary: objectSummary{ID: id, Name: input.Name, ObjectTypeID: input.ObjectTypeID, Description: input.Description, Image: input.Image, UpdatedAt: now, CreatedAt: now}, GameID: gameID, Fields: fields}
+	item.Values, err = a.objectValues(r.Context(), tx, item, fields)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create_failed", "Could not prepare object history.")
 		return
 	}
-	item := objectRecord{objectSummary: objectSummary{ID: id, Name: input.Name, ObjectTypeID: input.ObjectTypeID, Description: input.Description, Image: input.Image, UpdatedAt: now, CreatedAt: now}, GameID: gameID, Fields: fields}
-	item.Values, err = a.objectValues(r.Context(), a.db, item, fields)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", "Object was saved but its values could not be loaded.")
+	if err := a.writeObjectHistory(r.Context(), tx, a.currentUser(r).ID, item, "created", "web", historyTime(time.Now()), objectValueHistoryChanges(fields, nil, item.Values)); err != nil {
+		writeError(w, http.StatusInternalServerError, "create_failed", "Could not record object history.")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "create_failed", "Could not create object.")
 		return
 	}
 	item.FormulaErrors = formulaErrors(fields, item.Values)
@@ -622,6 +655,7 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 		notFoundOrError(w, err, "Object")
 		return
 	}
+	oldName, oldDescription, oldImage := item.Name, item.Description, item.Image
 	var input struct {
 		Name        *string                    `json:"name"`
 		Description *string                    `json:"description"`
@@ -656,6 +690,16 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	changes := make([]objectHistoryChange, 0)
+	if change, ok := metadataHistoryChange("Object name", oldName, item.Name); ok {
+		changes = append(changes, change)
+	}
+	if change, ok := metadataHistoryChange("Description", oldDescription, item.Description); ok {
+		changes = append(changes, change)
+	}
+	if change, ok := metadataHistoryChange("Image", oldImage, item.Image); ok {
+		changes = append(changes, change)
+	}
 	if input.Values != nil {
 		fields, err := loadFieldsFrom(r.Context(), tx, item.ObjectTypeID, false)
 		if err != nil {
@@ -663,22 +707,34 @@ func (a *API) updateObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		item.Fields = fields
+		before, err := a.objectValues(r.Context(), tx, item, fields)
+		if err != nil {
+			writeError(w, 500, "database_error", "Could not read current object values.")
+			return
+		}
 		if err := a.saveValues(r.Context(), tx, item.GameID, item.ID, item.ObjectTypeID, fields, input.Values); err != nil {
 			writeValidationError(w, err)
 			return
 		}
+		item.Values, err = a.objectValues(r.Context(), tx, item, fields)
+		if err != nil {
+			writeError(w, 500, "update_failed", "Could not read updated object values.")
+			return
+		}
+		changes = append(changes, objectValueHistoryChanges(fields, before, item.Values)...)
 	}
 	_, err = tx.ExecContext(r.Context(), `UPDATE objects SET name=?,description=?,image=?,updated_at=? WHERE id=?`, item.Name, item.Description, item.Image, item.UpdatedAt, item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
 		return
 	}
-	if input.Values != nil {
-		item.Values, err = a.objectValues(r.Context(), tx, item, item.Fields)
-		if err != nil {
-			writeError(w, 500, "update_failed", "Could not read updated object values.")
+	if len(changes) > 0 {
+		if err := a.writeObjectHistory(r.Context(), tx, a.currentUser(r).ID, item, "updated", "web", historyTime(time.Now()), changes); err != nil {
+			writeError(w, 500, "update_failed", "Could not record object history.")
 			return
 		}
+	}
+	if input.Values != nil {
 		item.FormulaErrors = formulaErrors(item.Fields, item.Values)
 	}
 	if err := tx.Commit(); err != nil {
@@ -715,22 +771,35 @@ func (a *API) updateObjectValues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	before, err := a.objectValues(r.Context(), tx, item, item.Fields)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Could not read current object values.")
+		return
+	}
 	if err := a.saveValues(r.Context(), tx, item.GameID, item.ID, item.ObjectTypeID, item.Fields, input.Values); err != nil {
 		writeValidationError(w, err)
 		return
 	}
-	_, err = tx.ExecContext(r.Context(), `UPDATE objects SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), item.ID)
+	item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	_, err = tx.ExecContext(r.Context(), `UPDATE objects SET updated_at=? WHERE id=?`, item.UpdatedAt, item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update values.")
 		return
+	}
+	item.Values, err = a.objectValues(r.Context(), tx, item, item.Fields)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not read updated object values.")
+		return
+	}
+	changes := objectValueHistoryChanges(item.Fields, before, item.Values)
+	if len(changes) > 0 {
+		if err := a.writeObjectHistory(r.Context(), tx, a.currentUser(r).ID, item, "updated", "web", historyTime(time.Now()), changes); err != nil {
+			writeError(w, http.StatusInternalServerError, "update_failed", "Could not record object history.")
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update values.")
-		return
-	}
-	item.Values, err = a.objectValues(r.Context(), a.db, item, item.Fields)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", "Values saved but could not be read back.")
 		return
 	}
 	item.FormulaErrors = formulaErrors(item.Fields, item.Values)
@@ -745,8 +814,32 @@ func (a *API) setObjectArchived(w http.ResponseWriter, r *http.Request, archived
 		notFoundOrError(w, err, "Object")
 		return
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE objects SET archived=?,updated_at=? WHERE id=?`, boolInt(archived), time.Now().UTC().Format(time.RFC3339), item.ID)
+	if item.Archived == archived {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
+		return
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	historyAt := historyTime(time.Now())
+	_, err = tx.ExecContext(r.Context(), `UPDATE objects SET archived=?,updated_at=? WHERE id=?`, boolInt(archived), now, item.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
+		return
+	}
+	eventType := "archived"
+	if !archived {
+		eventType = "restored"
+	}
+	if err = a.writeObjectHistory(r.Context(), tx, a.currentUser(r).ID, item, eventType, "web", historyAt, nil); err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed", "Could not record object history.")
+		return
+	}
+	if err = tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, "update_failed", "Could not update object.")
 		return
 	}
@@ -1052,6 +1145,10 @@ func (a *API) finishObjectValues(ctx context.Context, db dbExecutor, item object
 }
 
 func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, item objectRecord, fields []fieldDefinition, values map[string]json.RawMessage) error {
+	return a.calculateFormulasWithOverrides(ctx, db, item, fields, values, nil)
+}
+
+func (a *API) calculateFormulasWithOverrides(ctx context.Context, db dbExecutor, item objectRecord, fields []fieldDefinition, values, relationshipOverrides map[string]json.RawMessage) error {
 	fieldMap := map[string]fieldDefinition{}
 	for _, field := range fields {
 		fieldMap[field.ID] = field
@@ -1112,7 +1209,7 @@ func (a *API) calculateFormulas(ctx context.Context, db dbExecutor, item objectR
 			inputs[key] = value
 		}
 		if cfg.Aggregation != nil {
-			aggregated, err := a.relationshipAggregate(ctx, db, item, *cfg.Aggregation)
+			aggregated, err := a.relationshipAggregateWithOverrides(ctx, db, item, *cfg.Aggregation, relationshipOverrides)
 			if err != nil {
 				delete(visiting, id)
 				return nil

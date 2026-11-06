@@ -63,10 +63,14 @@ The database and uploads are ignored by Git. Set environment variables before `m
 - **Game:** the owner-scoped data boundary.
 - **Section:** a custom, nested view that organizes object references. Sections support cards, lists, tables with selectable fields, checklists backed by a user-defined checkbox field, and progress calculated from a progress field, multiple numeric fields, or linked child objects. Child progress can stay direct for existing configurations or explicitly traverse recursive same-type relationships. Goals can be placed in multiple sections with shared progress.
 - **Object type:** a user-defined schema such as “Character”, “Location”, or “Project”. These names have no special backend meaning.
-- **Field definition:** a typed characteristic attached to an object type. Its type is immutable after creation. Fields can be archived and restored without losing values.
+- **Field definition:** a typed characteristic attached to an object type. Type changes use a dry-run migration wizard that previews dependencies and converts saved values transactionally. Fields can be archived and restored without losing values.
 - **Object:** a game-level record with one object type. Objects are not copied when placed into sections.
+- **Object images:** objects can have a primary portrait and a 50-image gallery. Gallery records reuse uploaded assets and protect them from cleanup while referenced.
 - **Field value:** data for one object and one stable field ID. Ordinary values are validated by Go and stored as JSON in a relational table. Object references use a separate relational table and are restricted to the same game.
 - **Goal:** a game-level manual goal, checklist, numeric tracker, or live rules using numeric, text, select, checkbox, and date fields with all/any conditions.
+- **Goal dependency:** a same-game prerequisite edge between goals. Cycles are rejected, and dependent goals cannot be completed while prerequisites remain open.
+- **Object preset:** a named set of field overrides over one canonical object. Presets do not replace base values or change goal evaluation.
+- **Game template:** a reusable structural copy of selected game sections, object types, fields, and presentation settings, remapped to fresh IDs.
 
 See [docs/architecture.md](docs/architecture.md) for the schema and ownership boundaries.
 
@@ -84,7 +88,7 @@ This is a local development application. Production deployment still needs an HT
 
 ## Images
 
-Game covers, game/section/type/field icons, type images, and object images can use local uploads. Uploads accept PNG, JPEG, GIF, WebP, and BMP up to 5 MB. Images are decoded and normalized to PNG; animated formats use their first frame. Both the input and processed image must fit within 5 MB, 6000 × 6000, and 16 million pixels. Each account can store 1000 images or 250 MB; Profile & Settings lists uploads and allows deletion of unused images. Failed file cleanup stays queued and can be retried from settings; startup and later image operations also retry cleanup. Images referenced by active or archived records are protected from deletion.
+Game covers, game/section/type/field icons, type images, object portraits, dashboard images, and object galleries can use local uploads. Uploads accept PNG, JPEG, GIF, WebP, and BMP up to 5 MB. Images are decoded and normalized to PNG; animated formats use their first frame. Both the input and processed image must fit within 5 MB, 6000 × 6000, and 16 million pixels. Each account can store 1000 images or 250 MB; Profile & Settings lists uploads and allows deletion of unused images. Failed file cleanup stays queued and can be retried from settings; startup and later image operations also retry cleanup. Images referenced by active or archived records, galleries, and dashboards are protected from deletion.
 
 ## Example workflow
 
@@ -102,9 +106,19 @@ The API uses JSON and authenticated cookies. Main route groups:
 
 - `/api/auth/*` — register, login, logout, current user, password change
 - `/api/games/*` — game library and game-scoped sections, object types, objects, and goals
+- `/api/games/{gameID}/overview` — game summary, active object/section counts, and six recently updated objects
+- `/api/games/{gameID}/dashboard` — per-game customizable Overview layout
+- `/api/games/{gameID}/comparison` — bounded comparison of 2–4 same-type object configurations
+- `/api/objects/{objectID}/graph` — bounded, incremental relationship graph expansion from one object
+- `/api/objects/{objectID}/gallery` and `/api/object-gallery/*` — gallery records and caption/order/primary controls
+- `/api/objects/{objectID}/presets` and `/api/object-presets/*` — reusable object overrides with effective formula values
+- `/api/goals/{goalID}/dependencies` — replace/query same-game goal prerequisites with cycle validation
+- `/api/templates/*` — save, import/export, duplicate, and instantiate reusable game structures
 - `/api/sections/*/placements` — shared many-to-many object placement
-- `/api/object-types/*/fields` and `/api/fields/*` — custom field definitions and archive/restore
+- `/api/object-types/*/fields` and `/api/fields/*` — custom field definitions, archive/restore, and safe type migration
+- `POST /api/fields/{fieldID}/type-change/preview` and `POST /api/fields/{fieldID}/type-change` — migration dry run and token-guarded apply
 - `/api/objects/*/values` — validated values and references
+- `/api/objects/{objectID}/history` — paginated object changes, filterable by field, event type, and date
 - `/api/goals/*` and `/api/goal-tasks/*` — goal progress and checklist tasks
 - `/api/assets/*` — local image uploads and authenticated image reads
 
@@ -121,16 +135,27 @@ Errors use a JSON `error` object containing a stable code and readable message. 
 - **Object library:** The Objects tab browses all active objects, including those without section placements, with name/description search, type filters, custom filters, and 50-object pages. Section views query their placements directly. Object editors, goal conditions, formula previews, and placement dialogs search the server beyond the current page.
 - **Goal library:** Search, status/type filters, sorting, and 20-goal pages are evaluated on the server after current progress is calculated. Condition cards show backend-evaluated values and named fields/objects.
 - **Safer editing:** Object metadata and values save together. Editors preserve literal strings and existing archived references, and guard against duplicate submissions. Clearing a field default sends an explicit clear operation.
+- **Object history:** Object cards provide a paginated timeline with field, event, and date filters. Numeric field changes can be plotted in a bounded 100-change SVG chart. Creation, metadata/value edits, archive, and restore events preserve stable field IDs and historical labels.
+- **Safe field migration:** Types & Fields offers Change Type. Preview covers active and archived objects, defaults, dependencies, and incompatible examples; apply uses a revision token, a bounded transaction, an audit row, and history events. Text/number conversions are exact or explicitly blocked; relationship conversions require ID serialization or an explicit same-game object mapping.
+- **Game templates:** Save the current game structure with inclusion options, import/export JSON, duplicate, edit metadata, and create new games from templates. Instantiation remaps IDs and rewrites formulas and references. Templates exclude objects, goals, and private notes.
+- **Build presets:** Save alternate per-object field overrides, copy base values, calculate formulas from effective values, and compare presets without mutating the base object. Type migration previews block while preset data still uses the field.
+- **Goal dependencies:** Edit prerequisite goals from the goal card. Dependencies are game-scoped, capped, cycle-checked, and enforced for manual, numeric, and final checklist completion.
+- **Custom dashboard:** Customize each game's Overview with recent objects, collections, goals, progress, statistics, custom tables, notes, and uploaded images. Reorder by drag and drop or keyboard buttons, resize responsively, and save a per-game layout. Each data widget has independent loading and retry states.
+- **Object gallery:** Add up to 50 uploaded images to any object, edit captions and order, select a primary gallery image, and remove links without deleting shared uploads. Archived objects retain readable galleries and block edits.
+- **Object comparison:** Compare 2–4 same-type objects, or add another saved configuration of one object. Numeric fields show differences and extrema with neutral-by-default higher/lower preferences; text, choices, booleans, dates, progress, references, and formula errors retain their own display behavior.
+- **Relationship graph:** Open a selected object's actual reference network, follow outbound and reverse-discovered edges, expand or collapse branches, zoom and pan, center/select nodes, and open object editors. API expansion is bounded to 100 nodes and 200 edges per response, and cycles deduplicate by object ID.
 - **Schema changes:** Removing choices checks active/archived objects, defaults, and goal conditions. The field editor offers replacement mappings; changing allowed reference types requires explicit removal of incompatible existing links.
 
-Existing databases receive pending migrations automatically on the next server start. Migration 003 adds stable asset-reference tracking and durable image-deletion cleanup. No migration is applied merely by editing the source.
+Existing databases receive pending migrations automatically on the next server start. Migrations 005–011 add object history, audited field-type changes, reusable templates, object presets, goal dependencies, per-game dashboards, and object galleries. Dashboard and gallery image references use the existing asset lifecycle. No migration is applied merely by editing the source.
 
 ## Current limits
 
 - Email, password reset, cloud sync, game-service imports, and multi-user sharing remain outside this local-only application.
-- Relationship formula aggregation targets ordinary numeric/progress fields, not formulas on other objects. Recursive section progress is limited to 64 relationship levels and 10,000 visited objects per request. Object custom-field sorting/filtering and goal progress sorting evaluate matching collections in Go, so those operations still use server memory proportional to the candidate set.
+- Relationship formula aggregation targets ordinary numeric/progress fields, not formulas on other objects. Recursive section progress is limited to 64 relationship levels and 10,000 visited objects per request. Ordinary typed custom-field filters and sorts run in SQLite before object pagination; formula-dependent object queries still evaluate candidates in Go. Goal queries still evaluate live field-target progress across their candidates, with request-local caches for shared objects and field definitions. Checklist progress is batched, and checklist tasks and goal placements are loaded in batches for the returned page.
 - New animated image uploads are stored as a static first frame. SVG, AVIF, and HEIC uploads are unsupported.
 - Progress view calculations are display settings; they do not overwrite stored object fields.
+- Dashboard layouts allow at most 20 widgets and are stored as a bounded JSON layout per game. Collection and goal widgets request only their configured first page.
+- Relationship graph reads cap each expansion at 100 nodes, 200 edges, and depth 4; the UI continues from one selected node at a time.
 
 See [the review fixes](docs/review-fixes.md) and [the security review](docs/security-review.md) for findings, fixes, and validation scope.
 

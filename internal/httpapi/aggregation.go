@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -91,6 +92,62 @@ func (a *API) relationshipAggregate(ctx context.Context, db dbExecutor, item obj
 		if config.Operation == "avg" {
 			result /= float64(count)
 		}
+	}
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0, fmt.Errorf("aggregation result is not finite")
+	}
+	return result, nil
+}
+
+func (a *API) relationshipAggregateWithOverrides(ctx context.Context, db dbExecutor, item objectRecord, config relationshipAggregation, overrides map[string]json.RawMessage) (float64, error) {
+	raw, overridden := overrides[config.RelationshipFieldID]
+	if !overridden {
+		return a.relationshipAggregate(ctx, db, item, config)
+	}
+	ids, err := mergeOverrideIDs(raw)
+	if err != nil {
+		return 0, err
+	}
+	count, result := 0, 0.0
+	for _, id := range ids {
+		var rawValue []byte
+		err := db.QueryRowContext(ctx, `SELECT COALESCE(v.value_json,f.default_json) FROM objects o JOIN object_types t ON t.id=o.object_type_id LEFT JOIN field_definitions f ON f.id=? AND f.object_type_id=o.object_type_id AND f.archived=0 LEFT JOIN field_values v ON v.object_id=o.id AND v.field_id=f.id WHERE o.id=? AND o.game_id=? AND o.archived=0 AND t.archived=0`, config.FieldID, id, item.GameID).Scan(&rawValue)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if config.Operation == "count" {
+			count++
+			continue
+		}
+		value, err := numericValue(rawValue)
+		if err != nil {
+			continue
+		}
+		if count == 0 && (config.Operation == "min" || config.Operation == "max") {
+			result = value
+		} else {
+			switch config.Operation {
+			case "sum", "avg":
+				result += value
+			case "min":
+				result = math.Min(result, value)
+			case "max":
+				result = math.Max(result, value)
+			}
+		}
+		count++
+	}
+	if config.Operation == "count" {
+		return float64(count), nil
+	}
+	if (config.Operation == "avg" || config.Operation == "min" || config.Operation == "max") && count == 0 {
+		return 0, fmt.Errorf("no linked numeric values")
+	}
+	if config.Operation == "avg" {
+		result /= float64(count)
 	}
 	if math.IsNaN(result) || math.IsInf(result, 0) {
 		return 0, fmt.Errorf("aggregation result is not finite")

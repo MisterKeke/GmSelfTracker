@@ -16,7 +16,7 @@ export function createNavigation({ renderSectionTree, renderPanel, state }) {
       </section>
       <nav class="tabbar" aria-label="Game workspace">
         ${tab('overview','✦ Overview')}
-        ${tab('library','◈ Objects')}${tab('goals','◎ Goals')}${tab('schema','⚙ Types & Fields')}
+        ${tab('library','◈ Objects')}${tab('goals','◎ Goals')}${tab('schema','⚙ Types & Fields')}${tab('templates','📘 Templates')}
       </nav>
       <div class="workspace-body">${renderSectionTree()}<section class="content">${renderPanel()}</section></div>`;
   }

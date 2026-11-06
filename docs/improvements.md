@@ -137,3 +137,95 @@ The benchmark reports measured durations and allocations; results depend on the 
 On a Windows 11 machine with an Intel Core i5-12500H, the latest one-iteration sample was: for 10,000 objects, a 50-item base page took 26.2 ms and allocated 509 KB; a name search took 43.3 ms and allocated 139 KB; custom numeric filter/sort took 155.2 ms and allocated 98.2 MB. At 5,000 objects, custom filter/sort took 75.5 ms and allocated 48.6 MB; at 1,000 it took 14.9 ms and allocated 9.6 MB. These are single-iteration diagnostics, not statistically stable throughput claims. The custom-field path is still the most expensive query and is a clear target for future streaming/value-index work.
 
 The follow-up's real-browser E2E pass could not be completed in this environment. `mingw32-make dev` started successfully with a disposable database, but the computer-use approval layer rejected opening Google Chrome, and the shell sandbox denied a loopback HTTP request. The server was stopped and the temporary database/upload directory was removed. The Go in-process HTTP tests and frontend unit/syntax checks did run; no claim is made that the new flows were visually exercised in a browser.
+
+## Overview data source — 2026-11-05
+
+Overview no longer derives its recent-object cards from the current paginated object query. The authenticated `GET /api/games/{gameID}/overview` endpoint returns active object and section counts plus at most six active objects ordered by `updated_at DESC, id ASC`. It hydrates only those six records, so section filters, saved object views, current page, and library sort cannot change the Overview list. Existing goal listing continues to supply three recently updated goals and game-wide goal/completion totals after live progress evaluation. Overview requests are game-scoped and sequence-guarded; the UI distinguishes loading, a truly empty game, an unavailable recent list, and a retryable request error. This additive endpoint needs no SQLite migration.
+
+## Typed object query execution — 2026-11-05
+
+Compatible custom-field predicates and sorts now run in SQLite before pagination for integer, decimal, percentage, text/long text, select, boolean, date, and progress values. Query construction uses validated field IDs, a fixed operator map, JSON type checks, and bound filter values. Missing object values use the field's configured default, matching hydration behavior. Sorting leaves missing/invalid values last in either direction and uses object ID as a stable tie-breaker. Formula evaluation is never moved into SQL; formula-dependent queries and reference filters continue through the existing full-candidate Go evaluator. `EXPLAIN QUERY PLAN` confirms the correlated value lookup uses the existing field-value primary-key index, so no new index or migration was required. Global totals and filtering-before-pagination remain unchanged. One regression fix also prevents `one_of` filter validation from overwriting the original JSON array while decoding its members.
+
+The existing `BenchmarkObjectQueryPage` was run before and after the query change on Windows 11 with an Intel Core i5-12500H. The pre-change diagnostic was a single iteration; the post-change sample used three iterations, so timing comparisons are indicative only. For 10,000 objects, custom numeric filter/sort measured 413 ms and 98.2 MB allocated before, then 320 ms/op and 2.68 MB/op after. For 5,000, the post-change sample measured 52.0 ms/op and 493 KB/op; for 1,000 it measured 9.30 ms/op and 434 KB/op. The clearest result is lower memory proportional to matching candidates; the timing sample is not a stable general throughput claim.
+
+Goal list reads no longer issue one checklist task query and one placement query per candidate goal. Completion/progress counts are aggregated in batches before filtering and sorting; full task and active-section placement details are hydrated in batches after pagination. Field-target progress remains live, and request-local object/field caching remains in place. The unpaged API response remains complete. No migration was required.
+
+`BenchmarkGoalQueryPage` exercises a page of 20 goals over 1,000 total manual/checklist goals with checklist tasks. A three-iteration Windows sample measured 6.62 ms/op and 1.94 MB/op. This fixture measures checklist batching and page-detail hydration; field-target/formula-heavy workloads were not benchmarked here.
+
+## Object history — 2026-11-05
+
+Migration 005 adds `object_history_events` and `object_history_changes`. Each event stores the game, object ID/name snapshot, authenticated user, server-selected source, event kind, and a fixed nanosecond UTC timestamp. Change rows keep stable field IDs, field-name/type snapshots, and JSON before/after values without foreign keys to field definitions, so a later rename does not rewrite history. Object creation, metadata/value edits, archive, and restore write their history rows in the same transaction as the underlying object mutation. Rejected or rolled-back edits do not leave events.
+
+`GET /api/objects/{objectID}/history` is authenticated and owner-scoped. It returns at most 100 events per page, total/offset metadata, stable change details, and known historical field labels. `event_type`, `field_id`, `since`, and `until` filters are parameterized. The object workspace adds a retro-styled timeline and an optional SVG numeric progression chart capped at the latest 100 matching changes. Only numeric snapshots are charted; values recorded while a field was text are omitted.
+
+API tests cover creation, field and metadata changes, archived/restored objects, immutable field-name snapshots, filters, pagination, failed-write atomicity, and cross-user access. Frontend tests cover the timeline states, escaped values, filters, and numeric-only charting. Browser verification for this new UI was not available in this environment.
+
+## Safe field type migration — 2026-11-05
+
+Migration 006 adds `field_type_migrations` and a trigger that allows a field type update only when the same transaction contains a matching audit row in `applying` state. The normal field PATCH route continues to reject type changes. `POST /api/fields/{fieldID}/type-change/preview` runs a consistent read transaction and returns affected/saved/archived counts, converted defaults, dependencies, incompatible examples, and a revision token. `POST /api/fields/{fieldID}/type-change` recomputes the preview inside its write transaction, rejects a stale token, converts values in bounded batches, records per-object `field_type_migrated` history, updates the field definition, marks the audit applied, and commits atomically.
+
+Conversion behavior is explicit:
+
+| Conversion | Behavior |
+|---|---|
+| Text ↔ long text | Lossless when the target length limit is met. |
+| Integer → decimal; percentage → decimal | Preserves numeric meaning. |
+| Decimal → integer | Only mathematically integral values pass; no rounding. |
+| Text → integer/decimal/percentage | Only valid numeric representations pass. |
+| Integer/decimal/text → percentage | Enforces 0–100; an explicit clamp policy may clamp to an endpoint. |
+| Numeric → text | Exact canonical decimal text; booleans become `true`/`false`. |
+| Text → boolean/date/select | Requires exact true/false, canonical ISO date, or a listed choice/replacement. |
+| Numeric → progress | Requires an explicit positive maximum. |
+| Progress → numeric | Requires an explicit current, maximum, or percentage strategy. |
+| Formula → numeric | Requires freeze confirmation and stores the current calculated result for each object. |
+| Reference → text/long text | Requires explicit JSON serialization of linked IDs. |
+| Text/long text/select → reference/references | Requires an explicit mapping to active objects owned by the same game and matching any allowed type. |
+| Single ↔ multiple reference | Preserves links when cardinality is compatible; multiple links block conversion to single. |
+
+Formula, goal, primary display, section-view, and relationship dependencies are inspected. Cross-family changes are blocked while incompatible dependencies remain. Unsupported conversions and invalid values stay blocked with examples rather than being rounded, truncated, or discarded. Preview/apply tests cover conversion rules, stale previews, ownership, archived values, formula freezing, reference serialization/mapping, the database guard, audit rows, and history events. The UI wizard is wired into Types & Fields; browser visual verification still requires the unavailable computer-use approval path.
+
+## Game templates — migration 007
+
+Templates save selected game structure: sections, object types, field definitions/defaults, and compatible presentation settings. They exclude objects, goals, and private game notes. The private template library supports create, inspect, import/export JSON, rename, duplicate, delete, and instantiate. Instantiation creates a new game transactionally with fresh IDs and remaps section parents, allowed type IDs, formula references, and view configuration. A per-user limit of 100 templates is checked for saves, imports, and copies.
+
+`POST /api/games/{gameID}/templates`, `/api/templates/*`, and `POST /api/templates/{templateID}/instantiate` are owner-scoped. Tests cover export/import validation, ID remapping, quota limits, and user isolation. Dashboard layouts are independent and are not included in templates.
+
+## Object presets — migration 008
+
+`object_presets` stores up to 100 named JSON overrides per object. A preset read merges overrides with the current canonical values and recalculates formulas, including relationship aggregations. Presets never write to base `field_values` and do not alter goals. The UI supports empty presets, copied base snapshots, edits, duplicates, deletion, and switching the displayed base/effective configuration. Preset creation and changes are added to object history.
+
+The field migration preview counts preset override use; apply is blocked until those overrides are removed. Tests cover owner/game scoping, value validation, formula recalculation, no canonical mutation, preset history, limits, and migration guards.
+
+## Goal dependencies — migration 009
+
+`goal_dependencies` stores directed prerequisite edges within one game. `GET` and `PUT /api/goals/{goalID}/dependencies` reject foreign-game goals, self-links, duplicate edges, over-limit lists, and cycles. Completion guards cover manual and numeric goal updates and the final checklist task. Goal cards show readiness and provide a dependency editor; removing or completing a prerequisite refreshes the dependent status.
+
+Tests cover cycle rejection, ownership, cascade cleanup, blockers, and completing goals after prerequisites. Dependencies affect completion only; they do not change the goal's underlying field target or checklist data.
+
+## Custom dashboard — migration 010
+
+`game_dashboards` stores a versioned JSON layout per game, capped at 64 KB and 20 widgets. The default layout presents recent objects, statistics, and active goals. The editor can add/configure/remove/reorder/resize widgets and reset the layout; layout changes stay in a draft until saved. Drag and drop is paired with keyboard move buttons. Responsive sizes use CSS grid.
+
+Widget types include recent objects, type/section collections, goals, progress, statistics, custom tables, plain-text notes, and uploaded images. Object and goal widgets fetch only their configured page, maintain independent loading/error states, and retry independently. Saved source references are retained when a source is archived; the affected widget reports the API error and remains configurable. Dashboard image assets participate in `asset_references` within the save transaction. API regressions cover defaults, persistence, ownership, malformed layouts, source validation, image reference protection, and per-game scope.
+
+## Object gallery — migration 011
+
+`object_gallery` rows point to existing uploaded asset IDs; image bytes are not duplicated. An object can have up to 50 gallery entries with captions, stable order values, and one optional primary marker. The gallery modal supports multi-upload, lazy thumbnails, opening full-size images, caption/order editing, choosing the primary image, and removing gallery references. Removing a row only releases that gallery reference; other resource references still protect the asset. Archived object galleries remain readable and immutable until the object/type is restored.
+
+Insert/update/delete triggers maintain asset references and validate that uploads belong to the object's user and remain active. Tests cover uploads, caption/order/primary updates, asset reuse, deletion protection, archived records, cross-user reads, and edit guards. The primary gallery marker stays separate from the main object portrait.
+
+## Object comparison
+
+`POST /api/games/{gameID}/comparison` accepts 2–4 active same-type object/configuration pairs and returns only selected objects plus their active shared fields. It calculates formula values server-side and includes names for referenced objects. The UI lets users select objects in the library or a section, compare their fields, choose a preset per column, and add another saved configuration of the same object for base-vs-preset or preset-vs-preset comparisons.
+
+Numeric fields show absolute and (when defined) percentage differences plus highest/lowest values. Preference is neutral by default, with optional higher/lower settings; no automatic “higher is better” colors are used. Other types retain their formatted values, references resolve to names, and formula errors are displayed. API tests cover same-type enforcement, selected preset values, foreign IDs, and permissions.
+
+## Relationship graph
+
+`GET /api/objects/{objectID}/graph` performs bounded breadth-first expansion from one selected object. Query options select depth (1–4), direction (`outbound` or `both`), and a node cap (2–100); responses cap edges at 200. Nodes deduplicate by stable object ID, edges preserve the actual stored source/target direction and field label, and reverse-discovered edges are marked. Archived nodes stay visible but are not expanded.
+
+The workspace graph is an SVG view with arrowed edges, node selection, object opening, on-demand expansion, branch collapse, zoom, pan, and centering. Each expansion starts at the chosen node instead of fetching a game-wide graph. Tests cover chains, branching, shared nodes, cycles, archived nodes, limits, direction, and cross-user/game isolation.
+
+## Cross-feature verification
+
+Migrations 005–011 are applied by the existing ordered migration runner. Focused API tests cover dashboard, gallery, comparison, and graph flows alongside prior history, migration, template, preset, and dependency suites. The final full Go and JavaScript suites are recorded in the implementation report. An authenticated visual browser pass was not completed because the computer-use approval layer rejected opening Chrome and the shell sandbox denied loopback HTTP requests; this limitation does not affect the in-process API and frontend unit test results.

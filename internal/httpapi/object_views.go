@@ -113,11 +113,13 @@ func (a *API) validateObjectView(ctx context.Context, gameID string, view *objec
 				}
 			}
 		case "select":
-			values := []json.RawMessage{c.Value}
+			var values []json.RawMessage
 			if c.Operator == "one_of" {
 				if json.Unmarshal(c.Value, &values) != nil || len(values) == 0 {
 					return fmt.Errorf("Select at least one filter option.")
 				}
+			} else {
+				values = []json.RawMessage{c.Value}
 			}
 			for _, value := range values {
 				if _, _, empty, err := validateFieldValue(f, value); err != nil || empty {

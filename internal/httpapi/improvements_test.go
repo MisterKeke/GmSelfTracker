@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -388,6 +389,105 @@ func TestObjectQueriesReturnGloballySortedFilteredPagesAndTotals(t *testing.T) {
 	if filtered["total"] != float64(2) || filtered["items"].([]any)[0].(map[string]any)["id"] != f.object || filtered["has_more"] != true {
 		t.Fatalf("custom field filtering and sorting should cover the full matching set: %#v", filtered)
 	}
+	planRows, err := f.e.db.Query(`EXPLAIN QUERY PLAN SELECT o.id FROM objects o JOIN object_types t ON t.id=o.object_type_id WHERE o.game_id=? AND o.object_type_id=? AND EXISTS (SELECT 1 FROM field_definitions fd LEFT JOIN field_values fv ON fv.object_id=o.id AND fv.field_id=fd.id WHERE fd.id=? AND fd.object_type_id=o.object_type_id AND fd.archived=0 AND json_type(CASE WHEN fv.value_json IS NOT NULL THEN fv.value_json ELSE fd.default_json END,'$') IN ('integer','real') AND CAST(json_extract(CASE WHEN fv.value_json IS NOT NULL THEN fv.value_json ELSE fd.default_json END,'$') AS REAL)>=?)`, f.game, f.typ, f.number, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	for planRows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := planRows.Scan(&id, &parent, &unused, &detail); err != nil {
+			planRows.Close()
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := planRows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	planText := strings.Join(plan, "\n")
+	if !strings.Contains(planText, "SEARCH fv USING INDEX") {
+		t.Fatalf("typed field filter should use an indexed field_values lookup, query plan:\n%s", planText)
+	}
+}
+
+func TestSQLObjectFieldFiltersMatchTypedValuesAndDefaults(t *testing.T) {
+	f := newImprovementFixture(t)
+	createField := func(name, kind string, options, defaultValue any) string {
+		t.Helper()
+		return f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": name, "field_type": kind, "options": options, "default_value": defaultValue})
+	}
+	score := createField("Default score", "decimal", map[string]any{}, 5)
+	f.u.expect("PATCH", "/api/objects/"+f.object+"/values", map[string]any{"values": map[string]any{score: 10}}, 200)
+	note := createField("Note", "text", map[string]any{}, nil)
+	choice := createField("Rank", "select", map[string]any{"choices": []string{"bronze", "silver", "gold"}}, nil)
+	checked := createField("Checked", "boolean", map[string]any{}, nil)
+	date := createField("Date", "date", map[string]any{}, nil)
+	progress := createField("Progress", "progress", map[string]any{}, nil)
+	makeObject := func(name string, values map[string]any) string {
+		t.Helper()
+		return f.create(t, "/api/games/"+f.game+"/objects", map[string]any{"name": name, "object_type_id": f.typ, "values": values})
+	}
+	alpha := makeObject("Alpha", map[string]any{score: -2, note: "Crystal cave", choice: "bronze", checked: true, date: "2025-04-03", progress: map[string]any{"current": 1, "max": 4}})
+	beta := makeObject("Beta", map[string]any{score: 20, note: "Castle", choice: "gold", checked: false, date: "2026-02-10", progress: map[string]any{"current": 4, "max": 4}})
+	gamma := makeObject("Gamma", map[string]any{score: 100, note: "Crystal bridge", choice: "silver", checked: true, date: "2026-04-10", progress: map[string]any{"current": 3, "max": 4}})
+	defaulted := makeObject("Defaulted", map[string]any{})
+
+	query := func(mode string, conditions []any, sort string) map[string]any {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"mode": mode, "conditions": conditions})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/games/" + f.game + "/objects?type_id=" + url.QueryEscape(f.typ) + "&sort=" + url.QueryEscape(sort) + "&direction=asc&limit=20&filters=" + url.QueryEscape(string(raw))
+		return decodeMap(t, f.u.expect("GET", path, nil, 200))
+	}
+	itemsByName := func(result map[string]any) []string {
+		t.Helper()
+		items := result["items"].([]any)
+		names := make([]string, 0, len(items))
+		for _, item := range items {
+			names = append(names, mapString(item.(map[string]any), "name"))
+		}
+		return names
+	}
+	filtered := query("all", []any{map[string]any{"field_id": score, "operator": "gte", "value": 5}}, score)
+	if filtered["total"] != float64(4) || fmt.Sprint(itemsByName(filtered)) != "[Defaulted Example Beta Gamma]" {
+		t.Fatalf("numeric SQL filtering, numeric ordering, and default values should be global and typed: %#v", filtered)
+	}
+	filtered = query("all", []any{map[string]any{"field_id": note, "operator": "contains", "value": "CRYSTAL"}}, "name")
+	if fmt.Sprint(itemsByName(filtered)) != "[Alpha Gamma]" {
+		t.Fatalf("text contains should remain case-insensitive: %#v", filtered)
+	}
+	filtered = query("any", []any{map[string]any{"field_id": score, "operator": "lt", "value": 0}, map[string]any{"field_id": note, "operator": "contains", "value": "cave"}}, "name")
+	if filtered["total"] != float64(1) || itemsByName(filtered)[0] != "Alpha" {
+		t.Fatalf("ANY conditions should be applied across the full collection: %#v", filtered)
+	}
+	filtered = query("all", []any{map[string]any{"field_id": choice, "operator": "one_of", "value": []string{"bronze", "gold"}}}, "name")
+	if fmt.Sprint(itemsByName(filtered)) != "[Alpha Beta]" {
+		t.Fatalf("select one-of should preserve exact choices: %#v", filtered)
+	}
+	filtered = query("all", []any{map[string]any{"field_id": checked, "operator": "checked"}}, "name")
+	if fmt.Sprint(itemsByName(filtered)) != "[Alpha Gamma]" {
+		t.Fatalf("boolean filters should preserve true and false values: %#v", filtered)
+	}
+	filtered = query("all", []any{map[string]any{"field_id": date, "operator": "after", "value": "2026-01-01"}}, "name")
+	if fmt.Sprint(itemsByName(filtered)) != "[Beta Gamma]" {
+		t.Fatalf("date filters should use date ordering: %#v", filtered)
+	}
+	filtered = query("all", []any{map[string]any{"field_id": progress, "operator": "above", "value": 50}}, "name")
+	if fmt.Sprint(itemsByName(filtered)) != "[Beta Gamma]" {
+		t.Fatalf("progress filters should compare the calculated ratio: %#v", filtered)
+	}
+	formula := f.create(t, "/api/object-types/"+f.typ+"/fields", map[string]any{"name": "Calculated score", "field_type": "formula", "options": map[string]any{"expression": "@{" + score + "} + 1"}})
+	filtered = query("all", []any{map[string]any{"field_id": formula, "operator": "gte", "value": 20}}, formula)
+	if fmt.Sprint(itemsByName(filtered)) != "[Beta Gamma]" {
+		t.Fatalf("formula-dependent filters and sorting should retain the Go evaluator: %#v", filtered)
+	}
+	if alpha == beta || beta == gamma || gamma == defaulted {
+		t.Fatal("fixture object IDs should be distinct")
+	}
 }
 
 func TestSectionProgressDirectRecursiveDeduplicationCyclesAndArchivedChildren(t *testing.T) {
@@ -500,12 +600,20 @@ func TestGoalQueriesFilterSortAndPaginateBeforeReturningResults(t *testing.T) {
 	if available["total"] != float64(2) {
 		t.Fatalf("section picker should exclude goals already placed there: %#v", available)
 	}
+	checklist := f.create(t, "/api/games/"+f.game+"/goals", map[string]any{"title": "Checklist", "goal_type": "checklist", "task_details": []any{map[string]any{"title": "First", "completed": true}, map[string]any{"title": "Second", "completed": false}}})
+	checklistSection := f.section(t, "Checklist section", nil)
+	f.u.expect("POST", "/api/sections/"+checklistSection+"/goals", map[string]any{"goal_id": checklist}, 204)
+	checklistPage := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals?type=checklist&sort=title&direction=asc&limit=1", nil, 200))
+	checklistItem := checklistPage["items"].([]any)[0].(map[string]any)
+	if checklistItem["id"] != checklist || checklistItem["progress"] != float64(50) || len(checklistItem["tasks"].([]any)) != 2 || checklistItem["section_ids"].([]any)[0] != checklistSection {
+		t.Fatalf("paged checklist details should preserve task progress and placements: %#v", checklistItem)
+	}
 	detail := decodeMap(t, f.u.expect("GET", "/api/goals/"+charlie, nil, 200))
 	if detail["id"] != charlie || detail["title"] != "Quest Charlie" {
 		t.Fatalf("single-goal endpoint should load full editor data: %#v", detail)
 	}
 	all := decodeMap(t, f.u.expect("GET", "/api/games/"+f.game+"/goals", nil, 200))
-	if len(all["items"].([]any)) != 3 {
+	if len(all["items"].([]any)) != 4 {
 		t.Fatalf("legacy unpaged goal listing should remain complete: %#v", all)
 	}
 }

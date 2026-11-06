@@ -4,11 +4,35 @@ import { sectionDisplayConfig, prettyValue, esc, renderIcon } from '../utils/for
 import { request } from '../api.js';
 
 export function createGameEditors({ tab, openForm, fieldRow, toast, state, root }) {
-  function openGameForm(edit=false) {
+  function openGameForm(edit=false, templateID='') {
     const game=edit?(state.game||{}):{};
-    openForm(edit?'EDIT GAME':'ADD A GAME',`${fieldRow('Game name','name',game.name||'','text',true,'required maxlength="120"')}${fieldRow('Icon or emoji','icon',game.icon||'🎮','text',true)}${fieldRow('Description','description',game.description||'','text',true,'maxlength="300"')}${fieldRow('Personal notes','personal_notes',game.personal_notes||'','text',true,'maxlength="2000"')}${fieldRow('Cover image URL (optional)','cover_image',game.cover_image||'','text',true)}<div class="form-field wide"><label for="f-cover-file">Or upload a cover image</label><input id="f-cover-file" name="cover_file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp"><small>PNG, JPEG, GIF, WebP, or BMP · maximum 5 MB · animations use the first frame</small></div><input type="hidden" name="form_action" value="${edit?'edit-game':'create-game'}">`,edit?'SAVE GAME':'CREATE GAME');
+    const templateOptions=(state.templates||[]).map(item=>`<option value="${esc(item.id)}" ${item.id===templateID?'selected':''}>${esc(item.name)} · ${Number(item.type_count)||0} types · ${Number(item.section_count)||0} sections</option>`).join('');
+    const templatePicker=!edit&&templateOptions?`<div class="form-field wide"><label for="f-template_id">Start from</label><select id="f-template_id" name="template_id"><option value="">An empty game</option>${templateOptions}</select><small>Template games get fresh type, field, formula, and section IDs. No objects, goals, or private notes are copied.</small></div>`:'';
+    openForm(edit?'EDIT GAME':'ADD A GAME',`${fieldRow('Game name','name',game.name||'','text',true,'required maxlength="120"')}${fieldRow('Icon or emoji','icon',game.icon||'🎮','text',true)}${templatePicker}${fieldRow('Description','description',game.description||'','text',true,'maxlength="300"')}${fieldRow('Personal notes','personal_notes',game.personal_notes||'','text',true,'maxlength="2000"')}${fieldRow('Cover image URL (optional)','cover_image',game.cover_image||'','text',true)}<div class="form-field wide"><label for="f-cover-file">Or upload a cover image</label><input id="f-cover-file" name="cover_file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp"><small>PNG, JPEG, GIF, WebP, or BMP · maximum 5 MB · animations use the first frame</small></div><input type="hidden" name="form_action" value="${edit?'edit-game':'create-game'}">`,edit?'SAVE GAME':'CREATE GAME');
     const form=ensureDialog(root).querySelector('#modal-form');form.dataset.form=edit?'edit-game':'create-game';
+    const templateSelect=form.elements.namedItem('template_id');
+    const updateTemplateMode=()=>{
+      const fromTemplate=Boolean(templateSelect?.value);
+      for(const name of ['description','personal_notes','cover_image','cover_file']){const input=form.elements.namedItem(name);if(input){input.disabled=fromTemplate;input.closest('.form-field')?.classList.toggle('template-disabled',fromTemplate);}}
+      if(templateSelect){const submit=root.querySelector('button[type="submit"][form="modal-form"]');if(submit)submit.textContent=fromTemplate?'CREATE FROM TEMPLATE':'CREATE GAME';}
+    };
+    templateSelect?.addEventListener('change',updateTemplateMode);updateTemplateMode();
     if(edit){form.insertAdjacentHTML('beforeend',`<div class="form-field wide" style="margin-top:10px"><button class="pixel-button danger" type="button" data-action="archive-game">Archive this game</button><small>Archived data stays saved and can be restored in settings.</small></div>`);}
+  }
+
+  function openTemplateForm(existing=null) {
+    const game=state.game;
+    if(!existing&&!game)throw new Error('Choose a game before saving its structure as a template.');
+    const body=existing
+      ?`${fieldRow('Template name','name',existing.name||'','text',true,'required maxlength="120"')}${fieldRow('Description','description',existing.description||'','text',true,'maxlength="500"')}${fieldRow('Icon or emoji','icon',existing.icon||'📘','text',true)}<input type="hidden" name="template_id" value="${esc(existing.id)}">`
+      :`${fieldRow('Template name','name',`${game.name} Template`,'text',true,'required maxlength="120"')}${fieldRow('Description','description',game.description||'','text',true,'maxlength="500"')}${fieldRow('Icon or emoji','icon','📘','text',true)}<div class="form-field wide"><fieldset class="template-options"><legend>Include in the template</legend><label><input type="checkbox" name="include_sections" value="true" checked> Section structure and display settings</label><label><input type="checkbox" name="include_types" value="true" checked> Object types and field definitions</label><label><input type="checkbox" name="include_field_defaults" value="true"> Field default values</label><label><input type="checkbox" name="include_presentation" value="true" checked> Icons, primary display fields, and presentation settings</label></fieldset><p class="dialog-help">Preview: ${state.types.length} object types, ${state.types.reduce((n,type)=>n+(type.fields||[]).length,0)} fields, and ${state.sections.length} sections. Objects, goals, uploaded images, and personal notes are never included.</p></div>`;
+    openForm(existing?'EDIT GAME TEMPLATE':'SAVE GAME AS TEMPLATE',`${body}<input type="hidden" name="form_action" value="${existing?'edit-template':'create-template'}">`,'SAVE TEMPLATE');
+    ensureDialog(root).querySelector('#modal-form').dataset.form=existing?'edit-template':'create-template';
+  }
+
+  function openTemplateImportForm() {
+    openForm('IMPORT GAME TEMPLATE',`<div class="form-field wide"><label for="f-template_file">Template JSON file</label><input id="f-template_file" name="template_file" type="file" accept="application/json,.json" required><small>Imports a versioned template structure. The file is validated before it is saved.</small></div><p class="dialog-help">Imported templates cannot contain executable code or remote resources. Personal objects and game progress are not imported.</p><input type="hidden" name="form_action" value="import-template">`,'IMPORT TEMPLATE');
+    ensureDialog(root).querySelector('#modal-form').dataset.form='import-template';
   }
 
   function openSectionForm(existing=null) {
@@ -83,5 +107,5 @@ export function createGameEditors({ tab, openForm, fieldRow, toast, state, root 
     input.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});search();
   }
 
-  return { openGameForm, openSectionForm, openTypeForm, openAddExisting, openAddExistingGoal };
+  return { openGameForm, openTemplateForm, openTemplateImportForm, openSectionForm, openTypeForm, openAddExisting, openAddExistingGoal };
 }

@@ -15,9 +15,14 @@ type cachedObject struct {
 	record objectRecord
 	err    error
 }
+type goalTaskSummary struct {
+	total     int
+	completed int
+}
 type readCache struct {
-	fields  map[fieldCacheKey][]fieldDefinition
-	objects map[string]cachedObject
+	fields            map[fieldCacheKey][]fieldDefinition
+	objects           map[string]cachedObject
+	goalTaskSummaries map[string]goalTaskSummary
 }
 
 func withReadCache(ctx context.Context) context.Context {
@@ -64,6 +69,10 @@ func (a *API) hydrateObjects(ctx context.Context, items []objectRecord) error {
 }
 
 func (a *API) hydrateObjectsBatch(ctx context.Context, items []objectRecord) error {
+	return a.hydrateObjectsBatchFrom(ctx, a.db, items)
+}
+
+func (a *API) hydrateObjectsBatchFrom(ctx context.Context, db dbExecutor, items []objectRecord) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -77,7 +86,7 @@ func (a *API) hydrateObjectsBatch(ctx context.Context, items []objectRecord) err
 		refs[i] = map[string][]string{}
 		if _, ok := fields[items[i].ObjectTypeID]; !ok {
 			var err error
-			fields[items[i].ObjectTypeID], err = a.loadFields(ctx, items[i].ObjectTypeID, false)
+			fields[items[i].ObjectTypeID], err = loadFieldsFrom(ctx, db, items[i].ObjectTypeID, false)
 			if err != nil {
 				return err
 			}
@@ -91,7 +100,7 @@ func (a *API) hydrateObjectsBatch(ctx context.Context, items []objectRecord) err
 		`SELECT object_id,section_id FROM section_placements WHERE object_id IN (` + placeholders + `) ORDER BY section_id`,
 	}
 	for kind, query := range queries {
-		rows, err := a.db.QueryContext(ctx, query, args...)
+		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -129,7 +138,7 @@ func (a *API) hydrateObjectsBatch(ctx context.Context, items []objectRecord) err
 		}
 	}
 	for i := range items {
-		if err := a.finishObjectValues(ctx, a.db, items[i], items[i].Fields, items[i].Values, refs[i]); err != nil {
+		if err := a.finishObjectValues(ctx, db, items[i], items[i].Fields, items[i].Values, refs[i]); err != nil {
 			return err
 		}
 		items[i].FormulaErrors = formulaErrors(items[i].Fields, items[i].Values)
