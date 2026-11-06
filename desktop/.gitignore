@@ -1,0 +1,6 @@
+/out/build/
+/out/deps/
+/out/portable-stage/
+/out/release/
+/out/preview/
+/out/*.txt

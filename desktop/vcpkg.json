@@ -1,0 +1,11 @@
+{
+  "name": "gm-self-tracker-desktop",
+  "version": "0.1.0",
+  "description": "Native C++20 and Qt 6 desktop tracker",
+  "dependencies": [
+    {
+      "name": "libwebp",
+      "default-features": false
+    }
+  ]
+}

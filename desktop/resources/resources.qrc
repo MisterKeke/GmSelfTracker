@@ -1,0 +1,15 @@
+<RCC>
+  <qresource prefix="/migrations">
+    <file alias="001_initial.sql">migrations/001_initial.sql</file>
+    <file alias="002_local_features.sql">migrations/002_local_features.sql</file>
+    <file alias="003_asset_lifecycle.sql">migrations/003_asset_lifecycle.sql</file>
+    <file alias="004_primary_display.sql">migrations/004_primary_display.sql</file>
+    <file alias="005_object_history.sql">migrations/005_object_history.sql</file>
+    <file alias="006_field_type_migrations.sql">migrations/006_field_type_migrations.sql</file>
+    <file alias="007_game_templates.sql">migrations/007_game_templates.sql</file>
+    <file alias="008_object_presets.sql">migrations/008_object_presets.sql</file>
+    <file alias="009_goal_dependencies.sql">migrations/009_goal_dependencies.sql</file>
+    <file alias="010_game_dashboards.sql">migrations/010_game_dashboards.sql</file>
+    <file alias="011_object_gallery.sql">migrations/011_object_gallery.sql</file>
+  </qresource>
+</RCC>

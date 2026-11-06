@@ -4,6 +4,13 @@ GameTracker is a local-first, customizable game progress tracker. You create the
 
 The visual design uses an indigo and plum game interface, parchment panels, stepped borders, pixel-style progress bars, and responsive layouts inspired by the supplied retro RPG dashboard.
 
+## Choose an implementation
+
+- **Web** uses Go, SQLite, HTML, CSS, and JavaScript. See [web setup](#run-locally).
+- **Desktop** is a native C++20 and Qt 6 Widgets application. See [desktop setup](desktop/README.md).
+
+The implementations have separate build commands and SQLite data locations. The root Makefile is for the web version. Run desktop build commands from the desktop directory.
+
 ## Stack
 
 - Go HTTP server and JSON REST API

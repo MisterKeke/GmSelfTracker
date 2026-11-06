@@ -5,3 +5,25 @@
 /bin/
 /.gocache/
 *.exe
+
+# Desktop build, packaging, and local data
+/desktop/build/
+/desktop/out/
+/desktop/Testing/
+/desktop/CMakeFiles/
+/desktop/CMakeCache.txt
+/desktop/CMakeUserPresets.json
+/desktop/.qtcreator/
+/desktop/.vs/
+/desktop/*.user
+/desktop/*.user.*
+/desktop/Debug/
+/desktop/Release/
+/desktop/RelWithDebInfo/
+/desktop/data/
+/desktop/uploads/
+/desktop/logs/
+/desktop/*.db*
+/desktop/*.sqlite*
+/desktop/*.log
+/desktop/*.zip
