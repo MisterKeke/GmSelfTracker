@@ -35,6 +35,8 @@ endif()
 
 add_library(gmst_core STATIC
     src/domain/game.h
+    src/domain/formula_evaluator.cpp
+    src/domain/formula_evaluator.h
     src/infrastructure/database/migration_runner.cpp
     src/infrastructure/database/migration_runner.h
     src/infrastructure/database/game_repository.cpp

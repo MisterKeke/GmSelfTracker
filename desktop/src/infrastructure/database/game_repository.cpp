@@ -1,16 +1,21 @@
 #include "infrastructure/database/game_repository.h"
 
 #include "infrastructure/database/migration_runner.h"
+#include "domain/formula_evaluator.h"
+#include "infrastructure/assets/image_decoder.h"
 
+#include <QBuffer>
 #include <QDir>
 #include <QDateTime>
 #include <QDate>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QMap>
 #include <cmath>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QUuid>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -61,6 +66,66 @@ QByteArray compactJson(const QJsonValue &value)
     return wrapped.mid(1, wrapped.size() - 2);
 }
 
+bool validateDefaultValue(const QString &fieldType, const QJsonObject &options,
+                          const QJsonValue &value, QString *error)
+{
+    if (value.isUndefined() || value.isNull()) return true;
+    const auto invalid = [error](const QString &message) {
+        if (error) *error = message;
+        return false;
+    };
+    if (fieldType == QStringLiteral("formula") || fieldType == QStringLiteral("reference") ||
+        fieldType == QStringLiteral("references"))
+        return invalid(QStringLiteral("Formula and object-reference fields cannot have a default value."));
+    if (fieldType == QStringLiteral("text") || fieldType == QStringLiteral("long_text")) {
+        const int maximum = fieldType == QStringLiteral("text") ? 2000 : 50000;
+        if (!value.isString()) return invalid(QStringLiteral("Enter text for the field default."));
+        if (value.toString().size() > maximum)
+            return invalid(QStringLiteral("Text default exceeds the %1 character limit.").arg(maximum));
+        return true;
+    }
+    if (fieldType == QStringLiteral("integer")) {
+        if (!value.isDouble() || !std::isfinite(value.toDouble()) || std::floor(value.toDouble()) != value.toDouble() ||
+            static_cast<long double>(value.toDouble()) < static_cast<long double>(std::numeric_limits<qint64>::min()) ||
+            static_cast<long double>(value.toDouble()) > static_cast<long double>(std::numeric_limits<qint64>::max()))
+            return invalid(QStringLiteral("Integer defaults must be whole numbers within the supported range."));
+        return true;
+    }
+    if (fieldType == QStringLiteral("decimal") || fieldType == QStringLiteral("percentage")) {
+        if (!value.isDouble() || !std::isfinite(value.toDouble()))
+            return invalid(QStringLiteral("Enter a finite numeric default."));
+        if (fieldType == QStringLiteral("percentage") && (value.toDouble() < 0 || value.toDouble() > 100))
+            return invalid(QStringLiteral("Percentage defaults must be between 0 and 100."));
+        return true;
+    }
+    if (fieldType == QStringLiteral("boolean")) {
+        if (!value.isBool()) return invalid(QStringLiteral("Boolean defaults must be true or false."));
+        return true;
+    }
+    if (fieldType == QStringLiteral("select")) {
+        if (!value.isString()) return invalid(QStringLiteral("Choose one of the available select options for the default."));
+        for (const QJsonValue &choice : options.value(QStringLiteral("choices")).toArray())
+            if (choice.toString() == value.toString()) return true;
+        return invalid(QStringLiteral("Select defaults must match one of the available choices."));
+    }
+    if (fieldType == QStringLiteral("date")) {
+        const QString date = value.toString();
+        if (!value.isString() || !QDate::fromString(date, Qt::ISODate).isValid() || date.size() != 10)
+            return invalid(QStringLiteral("Date defaults must use YYYY-MM-DD."));
+        return true;
+    }
+    if (fieldType == QStringLiteral("progress")) {
+        const QJsonObject progress = value.toObject();
+        const QJsonValue current = progress.value(QStringLiteral("current"));
+        const QJsonValue maximum = progress.value(QStringLiteral("max"));
+        if (!value.isObject() || !current.isDouble() || !maximum.isDouble() ||
+            !std::isfinite(current.toDouble()) || !std::isfinite(maximum.toDouble()) || maximum.toDouble() <= 0)
+            return invalid(QStringLiteral("Progress defaults need finite current and positive maximum values."));
+        return true;
+    }
+    return invalid(QStringLiteral("This field type does not accept a default value."));
+}
+
 QString historyEventId()
 {
     return uuid();
@@ -69,7 +134,8 @@ QString historyEventId()
 } // namespace
 
 GameRepository::GameRepository(const QString &databasePath)
-    : m_path(databasePath), m_connectionName(QStringLiteral("gmst-%1").arg(uuid()))
+    : m_path(databasePath), m_assetRoot(QFileInfo(databasePath).dir().filePath(QStringLiteral("uploads"))),
+      m_connectionName(QStringLiteral("gmst-%1").arg(uuid()))
 {
 }
 
@@ -101,7 +167,10 @@ bool GameRepository::open(QString *error)
         if (error) *error = migrationError;
         return false;
     }
-    return ensureLocalProfile(error);
+    if (!ensureLocalProfile(error)) return false;
+    QString cleanupError;
+    cleanupPendingAssets(&cleanupError);
+    return true;
 }
 
 bool GameRepository::isOpen() const
@@ -130,7 +199,7 @@ QVector<Game> GameRepository::games(QString *error) const
     QVector<Game> result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "SELECT g.id, g.name, g.description, g.icon, g.cover_image, "
+        "SELECT g.id, g.name, g.description, g.icon, g.cover_image, g.personal_notes, "
         "(SELECT COUNT(*) FROM objects o WHERE o.game_id=g.id AND o.archived=0), "
         "(SELECT COUNT(*) FROM sections s WHERE s.game_id=g.id AND s.archived=0), "
         "(SELECT COUNT(*) FROM goals gl WHERE gl.game_id=g.id), "
@@ -144,8 +213,8 @@ QVector<Game> GameRepository::games(QString *error) const
     while (query.next()) {
         result.append(Game{
             query.value(0).toString(), query.value(1).toString(), query.value(2).toString(),
-            query.value(3).toString(), query.value(4).toString(), query.value(5).toInt(),
-            query.value(6).toInt(), query.value(7).toInt(), query.value(8).toInt()
+            query.value(3).toString(), query.value(4).toString(), query.value(5).toString(),
+            query.value(6).toInt(), query.value(7).toInt(), query.value(8).toInt(), query.value(9).toInt()
         });
     }
     return result;
@@ -177,7 +246,7 @@ QVector<ObjectType> GameRepository::objectTypes(const QString &gameId, QString *
     QVector<ObjectType> result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "SELECT t.id,t.game_id,t.name,t.description,t.icon FROM object_types t "
+        "SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image FROM object_types t "
         "JOIN games g ON g.id=t.game_id WHERE t.game_id=? AND g.user_id=? AND g.archived=0 "
         "AND t.archived=0 ORDER BY t.sort_order,t.name COLLATE NOCASE"));
     query.addBindValue(gameId);
@@ -188,7 +257,7 @@ QVector<ObjectType> GameRepository::objectTypes(const QString &gameId, QString *
     }
     while (query.next()) {
         ObjectType type{query.value(0).toString(), query.value(1).toString(), query.value(2).toString(),
-            query.value(3).toString(), query.value(4).toString(), {}};
+            query.value(3).toString(), query.value(4).toString(), query.value(5).toString(), {}};
         QSqlQuery fieldQuery(m_database);
         fieldQuery.prepare(QStringLiteral(
             "SELECT id,object_type_id,name,field_type,icon,description,default_json,options_json,sort_order,archived "
@@ -215,6 +284,7 @@ QVector<ObjectType> GameRepository::objectTypes(const QString &gameId, QString *
 
 QVector<ObjectRecord> GameRepository::objects(const QString &gameId, QString *error) const
 {
+    if (error) error->clear();
     QVector<ObjectRecord> result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
@@ -271,6 +341,19 @@ QVector<ObjectRecord> GameRepository::objects(const QString &gameId, QString *er
         while (referencesQuery.next()) object.references[referencesQuery.value(0).toString()].append(referencesQuery.value(1).toString());
         result.append(object);
     }
+    const QVector<ObjectType> types = objectTypes(gameId, error);
+    if (types.isEmpty() && error && !error->isEmpty()) return {};
+    QMap<QString, QVector<FieldDefinition>> fieldsByType;
+    for (const ObjectType &type : types) fieldsByType.insert(type.id, type.fields);
+    for (ObjectRecord &object : result) {
+        const QVector<FieldDefinition> fields = fieldsByType.value(object.typeId);
+        for (const FieldDefinition &field : fields) {
+            if (!field.archived && !object.values.contains(field.id) &&
+                !field.defaultValue.isUndefined() && !field.defaultValue.isNull())
+                object.values.insert(field.id, field.defaultValue);
+        }
+        FormulaEvaluator::evaluate(fields, object, types, result);
+    }
     return result;
 }
 
@@ -320,6 +403,7 @@ HistoryPage GameRepository::objectHistory(const QString &objectId, const History
         where += QStringLiteral(" AND substr(e.created_at,1,10)<=?");
         parameters.append(filter.until.toString(Qt::ISODate));
     }
+    const int pageSize = filter.limit > 0 ? std::clamp(filter.limit, 1, 100) : HistoryFilter::pageSize;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
         "WITH page AS (SELECT e.id,e.event_type,e.created_at,e.rowid AS sequence "
@@ -329,8 +413,8 @@ HistoryPage GameRepository::objectHistory(const QString &objectId, const History
         "FROM page p LEFT JOIN object_history_changes c ON c.event_id=p.id "
         "ORDER BY rtrim(p.created_at,'Z') DESC,p.sequence DESC,c.id").arg(where));
     for (const QVariant &parameter : std::as_const(parameters)) query.addBindValue(parameter);
-    query.addBindValue(HistoryFilter::pageSize + 1);
-    query.addBindValue(static_cast<qint64>(std::max(0, filter.page)) * HistoryFilter::pageSize);
+    query.addBindValue(pageSize + 1);
+    query.addBindValue(static_cast<qint64>(std::max(0, filter.page)) * pageSize);
     if (!query.exec()) {
         if (error) *error = query.lastError().text();
         return {};
@@ -339,7 +423,7 @@ HistoryPage GameRepository::objectHistory(const QString &objectId, const History
     while (query.next()) {
         const QString id = query.value(0).toString();
         if (page.events.isEmpty() || page.events.constLast().id != id) {
-            if (page.events.size() == HistoryFilter::pageSize) {
+            if (page.events.size() == pageSize) {
                 page.hasMore = true;
                 break;
             }
@@ -927,9 +1011,10 @@ bool GameRepository::deleteGoal(const QString &goalId, QString *error)
 }
 
 bool GameRepository::createGame(const QString &name, const QString &description, const QString &icon,
-                                QString *createdId, QString *error)
+                                QString *createdId, QString *error, const QString &personalNotes,
+                                const QString &coverImage)
 {
-    if (name.trimmed().isEmpty()) {
+    if (name.trimmed().isEmpty() || name.trimmed().size() > 120) {
         if (error) *error = QStringLiteral("A game name is required.");
         return false;
     }
@@ -937,12 +1022,14 @@ bool GameRepository::createGame(const QString &name, const QString &description,
     const QString timestamp = nowUtc();
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "INSERT INTO games(id,user_id,name,description,icon,created_at,updated_at) VALUES(?,?,?,?,?,?,?)"));
+        "INSERT INTO games(id,user_id,name,description,icon,cover_image,personal_notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)"));
     query.addBindValue(id);
     query.addBindValue(m_userId);
     query.addBindValue(nonNullTrimmed(name));
     query.addBindValue(nonNullTrimmed(description));
     query.addBindValue(icon.isEmpty() ? QStringLiteral("🎮") : icon);
+    query.addBindValue(nonNullTrimmed(coverImage));
+    query.addBindValue(nonNullTrimmed(personalNotes));
     query.addBindValue(timestamp);
     query.addBindValue(timestamp);
     if (!query.exec()) {
@@ -955,11 +1042,17 @@ bool GameRepository::createGame(const QString &name, const QString &description,
 
 bool GameRepository::updateGame(const Game &game, QString *error)
 {
+    if (game.name.trimmed().isEmpty() || game.name.trimmed().size() > 120) {
+        if (error) *error = QStringLiteral("Game name must be between 1 and 120 characters.");
+        return false;
+    }
     QSqlQuery query(m_database);
-    query.prepare(QStringLiteral("UPDATE games SET name=?, description=?, icon=?, updated_at=? WHERE id=? AND user_id=? AND archived=0"));
+    query.prepare(QStringLiteral("UPDATE games SET name=?, description=?, icon=?, cover_image=?, personal_notes=?, updated_at=? WHERE id=? AND user_id=? AND archived=0"));
     query.addBindValue(nonNullTrimmed(game.name));
     query.addBindValue(nonNullTrimmed(game.description));
     query.addBindValue(game.icon);
+    query.addBindValue(nonNullTrimmed(game.coverImage));
+    query.addBindValue(nonNullTrimmed(game.personalNotes));
     query.addBindValue(nowUtc());
     query.addBindValue(game.id);
     query.addBindValue(m_userId);
@@ -1115,7 +1208,8 @@ bool GameRepository::createSection(const QString &gameId, const QString &parentI
 }
 
 bool GameRepository::createObjectType(const QString &gameId, const QString &name, const QString &description,
-                                      const QString &icon, QString *createdId, QString *error)
+                                      const QString &icon, QString *createdId, QString *error,
+                                      const QString &image)
 {
     const QString typeName = nonNullTrimmed(name);
     if (typeName.isEmpty() || typeName.size() > 80) {
@@ -1126,12 +1220,13 @@ bool GameRepository::createObjectType(const QString &gameId, const QString &name
     const QString timestamp = nowUtc();
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "INSERT INTO object_types(id,game_id,name,description,icon,created_at,updated_at) "
-        "SELECT ?,g.id,?,?,?,?,? FROM games g WHERE g.id=? AND g.user_id=? AND g.archived=0"));
+        "INSERT INTO object_types(id,game_id,name,description,icon,image,created_at,updated_at) "
+        "SELECT ?,g.id,?,?,?,?,?,? FROM games g WHERE g.id=? AND g.user_id=? AND g.archived=0"));
     query.addBindValue(id);
     query.addBindValue(typeName);
     query.addBindValue(nonNullTrimmed(description));
     query.addBindValue(icon.isEmpty() ? QStringLiteral("◈") : icon);
+    query.addBindValue(nonNullTrimmed(image));
     query.addBindValue(timestamp);
     query.addBindValue(timestamp);
     query.addBindValue(gameId);
@@ -1145,11 +1240,13 @@ bool GameRepository::createObjectType(const QString &gameId, const QString &name
 }
 
 bool GameRepository::createField(const QString &typeId, const QString &name, const QString &fieldType,
-                                 const QString &icon, const QJsonObject &options, QString *createdId, QString *error)
+                                 const QString &icon, const QJsonObject &options, QString *createdId, QString *error,
+                                 const QString &description, const QJsonValue &defaultValue)
 {
     static const QStringList allowed = {QStringLiteral("text"), QStringLiteral("long_text"), QStringLiteral("integer"),
         QStringLiteral("decimal"), QStringLiteral("percentage"), QStringLiteral("boolean"), QStringLiteral("select"),
-        QStringLiteral("date"), QStringLiteral("progress"), QStringLiteral("reference"), QStringLiteral("references")};
+        QStringLiteral("date"), QStringLiteral("progress"), QStringLiteral("reference"), QStringLiteral("references"),
+        QStringLiteral("formula")};
     if (!allowed.contains(fieldType)) {
         if (error) *error = QStringLiteral("Choose one of the supported field types.");
         return false;
@@ -1176,6 +1273,82 @@ bool GameRepository::createField(const QString &typeId, const QString &name, con
             uniqueChoices.insert(text);
         }
     }
+    if (fieldType == QStringLiteral("formula")) {
+        const QString expression = options.value(QStringLiteral("expression")).toString();
+        QString syntaxError;
+        if (expression.trimmed().isEmpty() || !FormulaEvaluator::validateExpression(expression, &syntaxError)) {
+            if (error) *error = syntaxError.isEmpty() ? QStringLiteral("Formula fields need an expression.") : syntaxError;
+            return false;
+        }
+        const QStringList refs = FormulaEvaluator::references(expression);
+        if (refs.isEmpty()) {
+            if (error) *error = QStringLiteral("Formula must reference at least one numeric field.");
+            return false;
+        }
+        QString gameId;
+        QSqlQuery owner(m_database);
+        owner.prepare(QStringLiteral("SELECT game_id FROM object_types WHERE id=? AND archived=0"));
+        owner.addBindValue(typeId);
+        if (!owner.exec() || !owner.next()) {
+            if (error) *error = QStringLiteral("The selected object type is unavailable.");
+            return false;
+        }
+        gameId = owner.value(0).toString();
+        const QJsonObject aggregation = options.value(QStringLiteral("aggregation")).toObject();
+        QString relationshipFieldId;
+        QString aggregatedFieldId;
+        QString operation;
+        if (!aggregation.isEmpty()) {
+            relationshipFieldId = aggregation.value(QStringLiteral("relationship_field_id")).toString();
+            aggregatedFieldId = aggregation.value(QStringLiteral("field_id")).toString();
+            operation = aggregation.value(QStringLiteral("operation")).toString();
+            if (!QStringList{QStringLiteral("sum"), QStringLiteral("avg"), QStringLiteral("min"), QStringLiteral("max"), QStringLiteral("count")}.contains(operation)) {
+                if (error) *error = QStringLiteral("Choose sum, avg, min, max, or count for the relationship aggregation.");
+                return false;
+            }
+            QSqlQuery relation(m_database);
+            relation.prepare(QStringLiteral("SELECT field_type,options_json FROM field_definitions WHERE id=? AND object_type_id=? AND archived=0"));
+            relation.addBindValue(relationshipFieldId);
+            relation.addBindValue(typeId);
+            if (!relation.exec() || !relation.next() ||
+                (relation.value(0).toString() != QStringLiteral("reference") && relation.value(0).toString() != QStringLiteral("references"))) {
+                if (error) *error = QStringLiteral("Choose an active relationship field on this type.");
+                return false;
+            }
+            if (operation != QStringLiteral("count")) {
+                QSqlQuery aggregateField(m_database);
+                aggregateField.prepare(QStringLiteral(
+                    "SELECT f.field_type,t.id FROM field_definitions f JOIN object_types t ON t.id=f.object_type_id "
+                    "WHERE f.id=? AND f.archived=0 AND t.game_id=? AND t.archived=0"));
+                aggregateField.addBindValue(aggregatedFieldId);
+                aggregateField.addBindValue(gameId);
+                if (!aggregateField.exec() || !aggregateField.next() ||
+                    !QStringList{QStringLiteral("integer"), QStringLiteral("decimal"), QStringLiteral("percentage"), QStringLiteral("progress")}.contains(aggregateField.value(0).toString())) {
+                    if (error) *error = QStringLiteral("Choose a numeric or progress field on a type in this game.");
+                    return false;
+                }
+                const QJsonObject relationOptions = QJsonDocument::fromJson(relation.value(1).toByteArray()).object();
+                const QString allowedType = relationOptions.value(QStringLiteral("allowed_type_id")).toString();
+                if (!allowedType.isEmpty() && allowedType != aggregateField.value(1).toString()) {
+                    if (error) *error = QStringLiteral("The aggregated field must belong to the allowed target type.");
+                    return false;
+                }
+            }
+        }
+        for (const QString &ref : refs) {
+            if (ref == QStringLiteral("related") && !aggregation.isEmpty()) continue;
+            QSqlQuery dependency(m_database);
+            dependency.prepare(QStringLiteral("SELECT field_type FROM field_definitions WHERE id=? AND object_type_id=? AND archived=0"));
+            dependency.addBindValue(ref);
+            dependency.addBindValue(typeId);
+            if (!dependency.exec() || !dependency.next() ||
+                !QStringList{QStringLiteral("integer"), QStringLiteral("decimal"), QStringLiteral("percentage"), QStringLiteral("progress"), QStringLiteral("formula")}.contains(dependency.value(0).toString())) {
+                if (error) *error = QStringLiteral("Formulas can reference numeric or formula fields on this object type only.");
+                return false;
+            }
+        }
+    }
+    if (!validateDefaultValue(fieldType, options, defaultValue, error)) return false;
     QString allowedTypeId;
     if (fieldType == QStringLiteral("reference") || fieldType == QStringLiteral("references")) {
         const QJsonValue allowedType = options.value(QStringLiteral("allowed_type_id"));
@@ -1204,13 +1377,15 @@ bool GameRepository::createField(const QString &typeId, const QString &name, con
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
         "INSERT INTO field_definitions(id,object_type_id,name,field_type,icon,description,default_json,options_json,sort_order,created_at,updated_at) "
-        "SELECT ?,t.id,?,?,?,?,NULL,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM field_definitions WHERE object_type_id=t.id),?,? "
+        "SELECT ?,t.id,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM field_definitions WHERE object_type_id=t.id),?,? "
         "FROM object_types t JOIN games g ON g.id=t.game_id WHERE t.id=? AND t.archived=0 AND g.user_id=? AND g.archived=0"));
     query.addBindValue(id);
     query.addBindValue(fieldName);
     query.addBindValue(fieldType);
     query.addBindValue(icon.isEmpty() ? QStringLiteral("✦") : icon);
-    query.addBindValue(QStringLiteral(""));
+    query.addBindValue(nonNullTrimmed(description));
+    query.addBindValue(defaultValue.isUndefined() || defaultValue.isNull()
+        ? QVariant() : QVariant(QString::fromUtf8(compactJson(defaultValue))));
     query.addBindValue(QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact)));
     query.addBindValue(timestamp);
     query.addBindValue(timestamp);
@@ -1623,6 +1798,285 @@ bool GameRepository::archiveObject(const QString &objectId, QString *error)
         if (error) *error = event.lastError().isValid() ? event.lastError().text() : m_database.lastError().text();
         return false;
     }
+    return true;
+}
+
+QVector<UploadedAsset> GameRepository::uploadedAssets(QString *error)
+{
+    if (error) error->clear();
+    QString cleanupError;
+    const bool cleanupOkay = cleanupPendingAssets(&cleanupError);
+    QVector<UploadedAsset> result;
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("SELECT id,size_bytes,deleted_at FROM uploaded_assets WHERE user_id=? ORDER BY created_at DESC,id"));
+    query.addBindValue(m_userId);
+    if (!query.exec()) {
+        if (error) *error = query.lastError().text();
+        return result;
+    }
+    while (query.next()) {
+        const QString id = query.value(0).toString();
+        result.append(UploadedAsset{id, QStringLiteral("/api/assets/") + id, query.value(1).toLongLong(), !query.value(2).isNull()});
+    }
+    if (query.lastError().isValid() && error) *error = query.lastError().text();
+    else if (!cleanupOkay && error) *error = cleanupError;
+    return result;
+}
+
+bool GameRepository::uploadAsset(const QByteArray &encoded, UploadedAsset *created, QString *error)
+{
+    if (error) error->clear();
+    QString decodeError;
+    const QImage decoded = ImageDecoder::decode(encoded, &decodeError);
+    if (decoded.isNull()) {
+        if (error) *error = decodeError.isEmpty() ? QStringLiteral("The image could not be decoded.") : decodeError;
+        return false;
+    }
+    QByteArray normalized;
+    QBuffer buffer(&normalized);
+    if (!buffer.open(QIODevice::WriteOnly) || !decoded.save(&buffer, "PNG")) {
+        if (error) *error = QStringLiteral("Could not normalize the image to PNG.");
+        return false;
+    }
+    if (normalized.isEmpty() || normalized.size() > ImageDecoder::maximumBytes) {
+        if (error) *error = QStringLiteral("The processed image exceeds the 5 MB storage limit.");
+        return false;
+    }
+    QString cleanupError;
+    cleanupPendingAssets(&cleanupError);
+    if (!QDir().mkpath(m_assetRoot)) {
+        if (error) *error = QStringLiteral("Could not create the private image storage directory.");
+        return false;
+    }
+    QFile::setPermissions(m_assetRoot, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QString id = uuid();
+    const QString filename = id + QStringLiteral(".png");
+    QString path;
+    if (!resolveAssetPath(filename, &path, error)) return false;
+
+    QSaveFile file(path);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly) || file.write(normalized) != normalized.size() || !file.commit()) {
+        const QString detail = file.errorString();
+        file.cancelWriting();
+        if (error) *error = QStringLiteral("Could not write the image file: %1").arg(detail);
+        return false;
+    }
+    QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+
+    if (!m_database.transaction()) {
+        QFile::remove(path);
+        if (error) *error = m_database.lastError().text();
+        return false;
+    }
+    QSqlQuery quota(m_database);
+    quota.prepare(QStringLiteral("SELECT COUNT(*),COALESCE(SUM(size_bytes),0) FROM uploaded_assets WHERE user_id=?"));
+    quota.addBindValue(m_userId);
+    if (!quota.exec() || !quota.next()) {
+        const QString detail = quota.lastError().text();
+        m_database.rollback();
+        QFile::remove(path);
+        if (error) *error = detail;
+        return false;
+    }
+    const int count = quota.value(0).toInt();
+    const qint64 usedBytes = quota.value(1).toLongLong();
+    if (count >= 1000 || usedBytes + normalized.size() > 250LL * 1024 * 1024) {
+        m_database.rollback();
+        QFile::remove(path);
+        if (error) *error = QStringLiteral("The account image limit is 1000 files or 250 MB.");
+        return false;
+    }
+    QSqlQuery insert(m_database);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO uploaded_assets(id,user_id,game_id,filename,mime_type,size_bytes,created_at,deleted_at) VALUES(?,?,NULL,?,'image/png',?,?,NULL)"));
+    insert.addBindValue(id);
+    insert.addBindValue(m_userId);
+    insert.addBindValue(filename);
+    insert.addBindValue(normalized.size());
+    insert.addBindValue(nowUtc());
+    if (!insert.exec() || !m_database.commit()) {
+        const QString detail = insert.lastError().isValid() ? insert.lastError().text() : m_database.lastError().text();
+        m_database.rollback();
+        QFile::remove(path);
+        if (error) *error = detail;
+        return false;
+    }
+    if (created) *created = UploadedAsset{id, QStringLiteral("/api/assets/") + id, normalized.size(), false};
+    return true;
+}
+
+bool GameRepository::deleteAsset(const QString &assetId, bool *pendingDeletion, QString *error)
+{
+    if (error) error->clear();
+    if (pendingDeletion) *pendingDeletion = false;
+    if (!m_database.transaction()) {
+        if (error) *error = m_database.lastError().text();
+        return false;
+    }
+    QSqlQuery lookup(m_database);
+    lookup.prepare(QStringLiteral("SELECT deleted_at FROM uploaded_assets WHERE id=? AND user_id=?"));
+    lookup.addBindValue(assetId);
+    lookup.addBindValue(m_userId);
+    if (!lookup.exec() || !lookup.next()) {
+        m_database.rollback();
+        if (error) *error = lookup.lastError().isValid() ? lookup.lastError().text() : QStringLiteral("The image is unavailable.");
+        return false;
+    }
+    const bool alreadyQueued = !lookup.value(0).isNull();
+    if (!alreadyQueued) {
+        QSqlQuery used(m_database);
+        used.prepare(QStringLiteral("SELECT COUNT(*) FROM asset_references WHERE asset_id=?"));
+        used.addBindValue(assetId);
+        if (!used.exec() || !used.next()) {
+            m_database.rollback();
+            if (error) *error = used.lastError().text();
+            return false;
+        }
+        if (used.value(0).toInt() > 0) {
+            m_database.rollback();
+            if (error) *error = QStringLiteral("This image is still used by a record, including an archived record.");
+            return false;
+        }
+        QSqlQuery queue(m_database);
+        queue.prepare(QStringLiteral("UPDATE uploaded_assets SET deleted_at=? WHERE id=? AND user_id=? AND deleted_at IS NULL"));
+        queue.addBindValue(nowUtc());
+        queue.addBindValue(assetId);
+        queue.addBindValue(m_userId);
+        if (!queue.exec() || queue.numRowsAffected() != 1) {
+            m_database.rollback();
+            if (error) *error = queue.lastError().isValid() ? queue.lastError().text() : QStringLiteral("Could not queue image deletion.");
+            return false;
+        }
+    }
+    if (!m_database.commit()) {
+        if (error) *error = m_database.lastError().text();
+        m_database.rollback();
+        return false;
+    }
+    QString cleanupError;
+    if (!cleanupPendingAssets(&cleanupError)) {
+        if (pendingDeletion) *pendingDeletion = true;
+        if (error) *error = cleanupError;
+    }
+    return true;
+}
+
+QImage GameRepository::loadAssetImage(const QString &reference, QString *error) const
+{
+    if (error) error->clear();
+    static const QString prefix = QStringLiteral("/api/assets/");
+    if (!reference.startsWith(prefix) || reference.size() != prefix.size() + 36) {
+        if (error) *error = QStringLiteral("The image reference is invalid.");
+        return {};
+    }
+    const QString id = reference.mid(prefix.size());
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("SELECT filename FROM uploaded_assets WHERE id=? AND user_id=? AND deleted_at IS NULL"));
+    query.addBindValue(id);
+    query.addBindValue(m_userId);
+    if (!query.exec() || !query.next()) {
+        if (error) *error = query.lastError().isValid() ? query.lastError().text() : QStringLiteral("The image is unavailable.");
+        return {};
+    }
+    QString path;
+    if (!resolveAssetPath(query.value(0).toString(), &path, error)) return {};
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("The image file is unavailable: %1").arg(file.errorString());
+        return {};
+    }
+    const QByteArray encoded = file.read(ImageDecoder::maximumBytes + 1);
+    if (file.error() != QFileDevice::NoError) {
+        if (error) *error = file.errorString();
+        return {};
+    }
+    return ImageDecoder::decode(encoded, error);
+}
+
+bool GameRepository::retryAssetCleanup(QString *error)
+{
+    if (error) error->clear();
+    return cleanupPendingAssets(error);
+}
+
+bool GameRepository::cleanupPendingAssets(QString *error)
+{
+    if (error) error->clear();
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("SELECT id,filename FROM uploaded_assets WHERE user_id=? AND deleted_at IS NOT NULL ORDER BY deleted_at,id LIMIT 25"));
+    query.addBindValue(m_userId);
+    if (!query.exec()) {
+        if (error) *error = query.lastError().text();
+        return false;
+    }
+    QVector<QPair<QString, QString>> pending;
+    while (query.next()) pending.append({query.value(0).toString(), query.value(1).toString()});
+    if (query.lastError().isValid()) {
+        if (error) *error = query.lastError().text();
+        return false;
+    }
+    bool success = true;
+    QString firstError;
+    for (const auto &entry : pending) {
+        QString path;
+        QString pathError;
+        if (!resolveAssetPath(entry.second, &path, &pathError)) {
+            success = false;
+            if (firstError.isEmpty()) firstError = pathError;
+            continue;
+        }
+        if (QFileInfo::exists(path) && !QFile::remove(path)) {
+            success = false;
+            if (firstError.isEmpty()) firstError = QStringLiteral("Could not remove pending image file: %1").arg(path);
+            continue;
+        }
+        QSqlQuery remove(m_database);
+        remove.prepare(QStringLiteral("DELETE FROM uploaded_assets WHERE id=? AND user_id=? AND deleted_at IS NOT NULL"));
+        remove.addBindValue(entry.first);
+        remove.addBindValue(m_userId);
+        if (!remove.exec() || remove.numRowsAffected() != 1) {
+            success = false;
+            if (firstError.isEmpty()) firstError = remove.lastError().isValid() ? remove.lastError().text() : QStringLiteral("Could not finish pending image deletion.");
+        }
+    }
+    if (!success && error) *error = firstError;
+    return success;
+}
+
+bool GameRepository::resolveAssetPath(const QString &filename, QString *path, QString *error) const
+{
+    if (filename.isEmpty() || QFileInfo(filename).fileName() != filename || filename.contains(QLatin1Char('/')) ||
+        filename.contains(QLatin1Char('\\')) || !filename.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive) ||
+        filename.size() != 40) {
+        if (error) *error = QStringLiteral("The stored image name is invalid.");
+        return false;
+    }
+    const QString absoluteRoot = QDir::cleanPath(QFileInfo(m_assetRoot).absoluteFilePath());
+    const QString canonicalRoot = QDir::cleanPath(QDir::fromNativeSeparators(QFileInfo(absoluteRoot).canonicalFilePath()));
+    if (canonicalRoot.isEmpty()) {
+        if (error) *error = QStringLiteral("The private image storage directory is unavailable.");
+        return false;
+    }
+    const QString expectedRoot = QDir::cleanPath(QDir::fromNativeSeparators(absoluteRoot));
+    if (canonicalRoot.compare(expectedRoot, Qt::CaseInsensitive) != 0) {
+        if (error) *error = QStringLiteral("The private image storage directory resolves outside its owned location.");
+        return false;
+    }
+    const QString candidate = QDir::cleanPath(QDir(canonicalRoot).filePath(filename));
+    const QFileInfo candidateInfo(candidate);
+    const QString rootPrefix = canonicalRoot.endsWith(QLatin1Char('/')) ? canonicalRoot : canonicalRoot + QLatin1Char('/');
+    QString resolved;
+    if (candidateInfo.exists()) resolved = QDir::cleanPath(QDir::fromNativeSeparators(candidateInfo.canonicalFilePath()));
+    else {
+        const QString parent = QDir::cleanPath(QDir::fromNativeSeparators(QFileInfo(candidateInfo.absolutePath()).canonicalFilePath()));
+        if (parent == canonicalRoot) resolved = QDir::cleanPath(parent + QLatin1Char('/') + filename);
+    }
+    if (resolved.isEmpty() || !resolved.startsWith(rootPrefix, Qt::CaseInsensitive)) {
+        if (error) *error = QStringLiteral("The resolved image path is outside the private storage directory.");
+        return false;
+    }
+    if (path) *path = QDir::toNativeSeparators(candidate);
     return true;
 }
 

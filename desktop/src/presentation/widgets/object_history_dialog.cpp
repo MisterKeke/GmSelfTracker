@@ -48,9 +48,10 @@ public:
         setAccessibleName(QStringLiteral("Numeric field history chart"));
     }
 
-    void setData(const HistoryPage &page, const QString &fieldId)
+    void setData(const HistoryPage &page, const QString &fieldId, const QString &error = {})
     {
         m_values.clear();
+        m_error = error;
         setVisible(!fieldId.isEmpty());
         if (fieldId.isEmpty()) return;
         for (auto event = page.events.crbegin(); event != page.events.crend(); ++event) {
@@ -67,8 +68,13 @@ protected:
         QPainter painter(this);
         painter.fillRect(rect(), QColor(QStringLiteral("#fffaf0")));
         painter.setPen(QColor(QStringLiteral("#30233d")));
+        if (!m_error.isEmpty()) {
+            painter.drawText(rect().adjusted(10, 6, -10, -6), Qt::AlignCenter | Qt::TextWordWrap,
+                             QStringLiteral("Could not load chart data. %1").arg(m_error));
+            return;
+        }
         if (m_values.isEmpty()) {
-            painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("No numeric values on this page."));
+            painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("No numeric values in the latest 100 matching changes."));
             return;
         }
         const auto [lowIt, highIt] = std::minmax_element(m_values.cbegin(), m_values.cend());
@@ -76,7 +82,8 @@ protected:
         const double high = *highIt;
         const QRectF plot = QRectF(rect()).adjusted(12, 24, -12, -12);
         painter.drawText(QRectF(12, 2, width() - 24, 20), Qt::AlignLeft | Qt::AlignVCenter,
-                         QStringLiteral("Page range  %1 to %2").arg(QString::number(low), QString::number(high)));
+                         QStringLiteral("Latest %1 changes · range  %2 to %3")
+                             .arg(m_values.size()).arg(QString::number(low), QString::number(high)));
         painter.drawRect(plot);
         QPolygonF points;
         const double scale = std::max(std::abs(low), std::abs(high));
@@ -94,6 +101,7 @@ protected:
 
 private:
     QVector<double> m_values;
+    QString m_error;
 };
 
 } // namespace
@@ -162,7 +170,21 @@ void showObjectHistory(QWidget *parent, const GameRepository &repository, const 
 
     HistoryFilter activeFilter;
     HistoryPage currentPage;
-    const auto updateChart = [&] { chart->setData(currentPage, chartField->currentData().toString()); };
+    const auto updateChart = [&] {
+        const QString chartFieldId = chartField->currentData().toString();
+        if (chartFieldId.isEmpty()) {
+            chart->setData({}, {});
+            return;
+        }
+        HistoryFilter chartFilter;
+        chartFilter.fieldId = chartFieldId;
+        chartFilter.since = activeFilter.since;
+        chartFilter.until = activeFilter.until;
+        chartFilter.limit = 100;
+        QString chartError;
+        const HistoryPage chartPage = repository.objectHistory(objectId, chartFilter, &chartError);
+        chart->setData(chartPage, chartFieldId, chartError);
+    };
     const auto loadPage = [&](const HistoryFilter &filter) {
         QString queryError;
         const HistoryPage page = repository.objectHistory(objectId, filter, &queryError);

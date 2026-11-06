@@ -1,6 +1,9 @@
 package httpapi
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestObjectPresetsKeepBaseValuesAndRecalculateFormulas(t *testing.T) {
 	f := newImprovementFixture(t)
@@ -28,17 +31,28 @@ func TestObjectPresetsKeepBaseValuesAndRecalculateFormulas(t *testing.T) {
 	if len(changes) < 3 {
 		t.Fatalf("preset history missing create, update, delete events: %#v", history)
 	}
-	for _, raw := range changes[:3] {
+	seenAudit := map[string]bool{}
+	for _, raw := range changes {
 		entry := raw.(map[string]any)
-		found := false
 		for _, changeRaw := range entry["changes"].([]any) {
-			if changeRaw.(map[string]any)["field_type"] == "preset" {
-				found = true
-				break
+			change := changeRaw.(map[string]any)
+			if change["field_type"] != "preset" {
+				continue
+			}
+			name := change["field_name"].(string)
+			switch {
+			case strings.HasPrefix(name, "Preset created:"):
+				seenAudit["created"] = true
+			case strings.HasPrefix(name, "Preset renamed:"):
+				seenAudit["updated"] = true
+			case strings.HasPrefix(name, "Preset deleted:"):
+				seenAudit["deleted"] = true
 			}
 		}
-		if !found {
-			t.Fatalf("preset audit was confused with canonical changes: %#v", entry)
+	}
+	for _, event := range []string{"created", "updated", "deleted"} {
+		if !seenAudit[event] {
+			t.Fatalf("preset %s audit missing from history: %#v", event, history)
 		}
 	}
 }

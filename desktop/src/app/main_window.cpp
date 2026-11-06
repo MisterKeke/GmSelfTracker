@@ -2,6 +2,8 @@
 
 #include "app/theme.h"
 #include "infrastructure/database/game_repository.h"
+#include "domain/formula_evaluator.h"
+#include "infrastructure/assets/image_decoder.h"
 #include "presentation/widgets/object_history_dialog.h"
 #include "presentation/widgets/sky_banner.h"
 
@@ -14,6 +16,9 @@
 #include <QDoubleValidator>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGridLayout>
@@ -21,11 +26,13 @@
 #include <QIntValidator>
 #include <QLabel>
 #include <QLineEdit>
+#include <QIcon>
 #include <QListWidget>
 #include <QMap>
 #include <QMessageBox>
 #include <QMenu>
 #include <QPointer>
+#include <QPixmap>
 #include <QPushButton>
 #include <QPalette>
 #include <QProgressBar>
@@ -670,6 +677,7 @@ void MainWindow::refreshFeaturePages()
         const int visibleObjects = std::min(4, static_cast<int>(m_objects.size()));
         for (int index = 0; index < visibleObjects; ++index) {
             const ObjectRecord &object = m_objects.at(index);
+            const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &value) { return value.id == object.typeId; });
             auto *card = panel(QStringLiteral("overviewObjectCard"), recent);
             card->setStyleSheet(QStringLiteral("QFrame#overviewObjectCard { background:#fff2d6;border:2px solid #c6a36c; }"));
             auto *cardLayout = new QHBoxLayout(card);
@@ -682,6 +690,15 @@ void MainWindow::refreshFeaturePages()
             auto *mark = textLabel(object.typeName.left(1).toUpper());
             mark->setAlignment(Qt::AlignCenter);
             mark->setStyleSheet(QStringLiteral("color:#ffe9b1;font-size:38px;font-weight:700;"));
+            QString artReference = object.image;
+            if (artReference.isEmpty() && typeIt != m_types.cend()) artReference = typeIt->image;
+            if (!artReference.isEmpty()) {
+                const QImage artwork = m_repository.loadAssetImage(artReference);
+                if (!artwork.isNull()) {
+                    mark->setText({});
+                    mark->setPixmap(QPixmap::fromImage(artwork).scaled(72, 100, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                }
+            }
             artLayout->addWidget(mark);
             cardLayout->addWidget(art);
 
@@ -695,7 +712,6 @@ void MainWindow::refreshFeaturePages()
             auto *type = textLabel(object.typeName);
             type->setStyleSheet(QStringLiteral("color:#735d75;font-size:10px;"));
             detailsLayout->addWidget(type);
-            const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &value) { return value.id == object.typeId; });
             int shownFields = 0;
             if (typeIt != m_types.cend()) {
                 for (const FieldDefinition &field : typeIt->fields) {
@@ -705,6 +721,8 @@ void MainWindow::refreshFeaturePages()
                         QStringList labels;
                         for (const QString &id : object.references.value(field.id)) labels.append(names.value(id, QStringLiteral("Archived object")));
                         valueText = labels.join(QStringLiteral(", "));
+                    } else if (field.fieldType == QStringLiteral("formula") && object.formulaErrors.contains(field.id)) {
+                        valueText = QStringLiteral("⚠ %1").arg(object.formulaErrors.value(field.id));
                     } else {
                         const QJsonValue value = object.values.value(field.id);
                         if (field.fieldType == QStringLiteral("progress") && value.isObject()) {
@@ -1123,6 +1141,16 @@ void MainWindow::refreshObjectPage()
             auto *mark = textLabel(object.typeName.left(1).toUpper(), QStringLiteral("inkText"));
             mark->setAlignment(Qt::AlignCenter);
             mark->setStyleSheet(QStringLiteral("color:#ffe9b1;font-size:42px;font-weight:700;"));
+            const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &value) { return value.id == object.typeId; });
+            QString artReference = object.image;
+            if (artReference.isEmpty() && typeIt != m_types.cend()) artReference = typeIt->image;
+            if (!artReference.isEmpty()) {
+                const QImage artwork = m_repository.loadAssetImage(artReference);
+                if (!artwork.isNull()) {
+                    mark->setText({});
+                    mark->setPixmap(QPixmap::fromImage(artwork).scaled(82, 108, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                }
+            }
             artLayout->addWidget(mark);
             cardLayout->addWidget(art);
             auto *details = new QWidget(card);
@@ -1144,7 +1172,6 @@ void MainWindow::refreshObjectPage()
             values->setHorizontalSpacing(10);
             values->setVerticalSpacing(1);
             int row = 0;
-            const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &value) { return value.id == object.typeId; });
             if (typeIt != m_types.cend()) {
                 for (const FieldDefinition &field : typeIt->fields) {
                     if (field.archived) continue;
@@ -1153,6 +1180,8 @@ void MainWindow::refreshObjectPage()
                         QStringList labels;
                         for (const QString &id : object.references.value(field.id)) labels.append(names.value(id, QStringLiteral("Unavailable")));
                         valueText = labels.join(QStringLiteral(", "));
+                    } else if (field.fieldType == QStringLiteral("formula") && object.formulaErrors.contains(field.id)) {
+                        valueText = QStringLiteral("⚠ %1").arg(object.formulaErrors.value(field.id));
                     } else {
                         const QJsonValue value = object.values.value(field.id);
                         if (field.fieldType == QStringLiteral("progress") && value.isObject()) {
@@ -1245,7 +1274,15 @@ void MainWindow::selectGame(const QString &gameId)
     const bool selected = !game.id.isEmpty();
     m_heroTitle->setText(selected ? game.name.toUpper() : QStringLiteral("GAME TRACKER"));
     m_heroDescription->setText(selected ? game.description : QStringLiteral("Choose a game or create your first one."));
+    m_heroSymbol->setPixmap({});
     m_heroSymbol->setText(selected ? game.icon : QStringLiteral("✧"));
+    if (selected && !game.coverImage.isEmpty()) {
+        const QImage cover = m_repository.loadAssetImage(game.coverImage);
+        if (!cover.isNull()) {
+            m_heroSymbol->setText({});
+            m_heroSymbol->setPixmap(QPixmap::fromImage(cover).scaled(m_heroSymbol->size(), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation));
+        }
+    }
     m_editGameButton->setVisible(selected);
     m_sections->setEnabled(selected);
     refreshSections();
@@ -1278,16 +1315,38 @@ void MainWindow::openCreateGame()
     auto *layout = new QVBoxLayout(&dialog);
     auto *form = new QFormLayout();
     auto *name = new QLineEdit(&dialog);
-    name->setMaxLength(80);
+    name->setMaxLength(120);
     name->setPlaceholderText(QStringLiteral("For example, Genshin Impact"));
     auto *description = new QTextEdit(&dialog);
     description->setPlaceholderText(QStringLiteral("A short note about this game"));
     description->setMaximumHeight(100);
     auto *icon = new QLineEdit(QStringLiteral("🎮"), &dialog);
-    icon->setMaxLength(16);
+    icon->setMaxLength(64);
+    auto *coverImage = new QLineEdit(&dialog);
+    coverImage->setObjectName(QStringLiteral("gameCoverImageInput"));
+    coverImage->setReadOnly(true);
+    auto *coverRow = new QWidget(&dialog);
+    auto *coverLayout = new QHBoxLayout(coverRow);
+    coverLayout->setContentsMargins(0, 0, 0, 0);
+    coverLayout->addWidget(coverImage, 1);
+    auto *chooseCover = button(QStringLiteral("Choose…"), QStringLiteral("softButton"), coverRow);
+    coverLayout->addWidget(chooseCover);
+    auto *clearCover = button(QStringLiteral("Clear"), QStringLiteral("softButton"), coverRow);
+    coverLayout->addWidget(clearCover);
+    connect(clearCover, &QPushButton::clicked, &dialog, [coverImage] { coverImage->clear(); });
+    connect(chooseCover, &QPushButton::clicked, &dialog, [this, &dialog, coverImage] {
+        const QString reference = openAssetLibrary(&dialog, coverImage->text());
+        if (!reference.isNull()) coverImage->setText(reference);
+    });
+    auto *notes = new QTextEdit(&dialog);
+    notes->setObjectName(QStringLiteral("gamePersonalNotesInput"));
+    notes->setPlaceholderText(QStringLiteral("Private notes for this playthrough"));
+    notes->setMaximumHeight(100);
     form->addRow(QStringLiteral("Game name"), name);
     form->addRow(QStringLiteral("Description"), description);
     form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Cover image"), coverRow);
+    form->addRow(QStringLiteral("Personal notes"), notes);
     layout->addLayout(form);
     QPushButton *save = nullptr;
     addDialogButtons(layout, &dialog, &save);
@@ -1296,7 +1355,8 @@ void MainWindow::openCreateGame()
     if (dialog.exec() != QDialog::Accepted) return;
     QString id;
     QString error;
-    if (!m_repository.createGame(name->text(), description->toPlainText(), icon->text(), &id, &error)) {
+    if (!m_repository.createGame(name->text(), description->toPlainText(), icon->text(), &id, &error,
+                                 notes->toPlainText(), coverImage->text())) {
         QMessageBox::warning(this, QStringLiteral("Could not add game"), error);
         return;
     }
@@ -1318,10 +1378,32 @@ void MainWindow::openEditGame()
     description->setPlainText(game.description);
     description->setMaximumHeight(100);
     auto *icon = new QLineEdit(game.icon, &dialog);
-    icon->setMaxLength(16);
+    icon->setMaxLength(64);
+    auto *coverImage = new QLineEdit(game.coverImage, &dialog);
+    coverImage->setObjectName(QStringLiteral("gameCoverImageInput"));
+    coverImage->setReadOnly(true);
+    auto *coverRow = new QWidget(&dialog);
+    auto *coverLayout = new QHBoxLayout(coverRow);
+    coverLayout->setContentsMargins(0, 0, 0, 0);
+    coverLayout->addWidget(coverImage, 1);
+    auto *chooseCover = button(QStringLiteral("Choose…"), QStringLiteral("softButton"), coverRow);
+    coverLayout->addWidget(chooseCover);
+    auto *clearCover = button(QStringLiteral("Clear"), QStringLiteral("softButton"), coverRow);
+    coverLayout->addWidget(clearCover);
+    connect(clearCover, &QPushButton::clicked, &dialog, [coverImage] { coverImage->clear(); });
+    connect(chooseCover, &QPushButton::clicked, &dialog, [this, &dialog, coverImage] {
+        const QString reference = openAssetLibrary(&dialog, coverImage->text());
+        if (!reference.isNull()) coverImage->setText(reference);
+    });
+    auto *notes = new QTextEdit(&dialog);
+    notes->setObjectName(QStringLiteral("gamePersonalNotesInput"));
+    notes->setPlainText(game.personalNotes);
+    notes->setMaximumHeight(100);
     form->addRow(QStringLiteral("Game name"), name);
     form->addRow(QStringLiteral("Description"), description);
     form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Cover image"), coverRow);
+    form->addRow(QStringLiteral("Personal notes"), notes);
     layout->addLayout(form);
     auto *archive = button(QStringLiteral("Archive Game"), QStringLiteral("softButton"), &dialog);
     archive->setObjectName(QStringLiteral("archiveGameButton"));
@@ -1349,6 +1431,8 @@ void MainWindow::openEditGame()
     game.name = name->text();
     game.description = description->toPlainText();
     game.icon = icon->text();
+    game.coverImage = coverImage->text();
+    game.personalNotes = notes->toPlainText();
     QString error;
     if (!m_repository.updateGame(game, &error)) {
         QMessageBox::warning(this, QStringLiteral("Could not update game"), error);
@@ -1402,28 +1486,44 @@ void MainWindow::openCreateType()
     auto *layout = new QVBoxLayout(&dialog);
     auto *form = new QFormLayout();
     auto *name = new QLineEdit(&dialog);
-    name->setMaxLength(120);
+    name->setMaxLength(80);
     auto *description = new QLineEdit(&dialog);
-    description->setMaxLength(500);
     auto *icon = new QLineEdit(QStringLiteral("◈"), &dialog);
-    icon->setMaxLength(16);
+    icon->setMaxLength(64);
+    auto *image = new QLineEdit(&dialog);
+    image->setObjectName(QStringLiteral("typeFallbackImageInput"));
+    image->setReadOnly(true);
+    auto *imageRow = new QWidget(&dialog);
+    auto *imageLayout = new QHBoxLayout(imageRow);
+    imageLayout->setContentsMargins(0, 0, 0, 0);
+    imageLayout->addWidget(image, 1);
+    auto *chooseImage = button(QStringLiteral("Choose…"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(chooseImage);
+    auto *clearImage = button(QStringLiteral("Clear"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(clearImage);
+    connect(clearImage, &QPushButton::clicked, &dialog, [image] { image->clear(); });
+    connect(chooseImage, &QPushButton::clicked, &dialog, [this, &dialog, image] {
+        const QString reference = openAssetLibrary(&dialog, image->text());
+        if (!reference.isNull()) image->setText(reference);
+    });
     form->addRow(QStringLiteral("Type name"), name);
     form->addRow(QStringLiteral("Description"), description);
     form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Fallback image"), imageRow);
     layout->addLayout(form);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
     auto *save = buttons->addButton(QStringLiteral("Create Type"), QDialogButtonBox::AcceptRole);
     save->setObjectName(QStringLiteral("goldButton"));
     layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, name, description, icon] {
+    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, name, description, icon, image] {
         if (name->text().trimmed().isEmpty()) {
             QMessageBox::warning(&dialog, QStringLiteral("Type name required"), QStringLiteral("Enter a name for this object type."));
             name->setFocus();
             return;
         }
         QString error;
-        if (!m_repository.createObjectType(m_selectedGameId, name->text(), description->text(), icon->text(), nullptr, &error)) {
+        if (!m_repository.createObjectType(m_selectedGameId, name->text(), description->text(), icon->text(), nullptr, &error, image->text())) {
             QMessageBox::warning(&dialog, QStringLiteral("Could not create type"), error);
             return;
         }
@@ -1446,22 +1546,64 @@ void MainWindow::openCreateField(const QString &typeId)
     auto *layout = new QVBoxLayout(&dialog);
     auto *form = new QFormLayout();
     auto *name = new QLineEdit(&dialog);
-    name->setMaxLength(120);
+    name->setObjectName(QStringLiteral("fieldNameInput"));
+    name->setMaxLength(80);
     auto *kind = new QComboBox(&dialog);
+    kind->setObjectName(QStringLiteral("fieldTypeChoice"));
     const QList<QPair<QString, QString>> fieldTypes = {
         {QStringLiteral("Text"), QStringLiteral("text")}, {QStringLiteral("Long text"), QStringLiteral("long_text")},
         {QStringLiteral("Integer"), QStringLiteral("integer")}, {QStringLiteral("Decimal"), QStringLiteral("decimal")},
         {QStringLiteral("Percentage"), QStringLiteral("percentage")}, {QStringLiteral("Boolean"), QStringLiteral("boolean")},
         {QStringLiteral("Select"), QStringLiteral("select")}, {QStringLiteral("Date"), QStringLiteral("date")},
         {QStringLiteral("Progress"), QStringLiteral("progress")}, {QStringLiteral("Reference"), QStringLiteral("reference")},
-        {QStringLiteral("Multiple references"), QStringLiteral("references")}
+        {QStringLiteral("Multiple references"), QStringLiteral("references")}, {QStringLiteral("Formula"), QStringLiteral("formula")}
     };
     for (const auto &entry : fieldTypes) kind->addItem(entry.first, entry.second);
     auto *icon = new QLineEdit(QStringLiteral("✦"), &dialog);
-    icon->setMaxLength(16);
+    icon->setMaxLength(64);
+    auto *description = new QLineEdit(&dialog);
+    description->setObjectName(QStringLiteral("fieldDescriptionInput"));
+    description->setPlaceholderText(QStringLiteral("Help text shown with this field"));
     form->addRow(QStringLiteral("Field name"), name);
     form->addRow(QStringLiteral("Field type"), kind);
     form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Description"), description);
+    auto *defaultEnabled = new QCheckBox(QStringLiteral("Set default"), &dialog);
+    defaultEnabled->setObjectName(QStringLiteral("fieldDefaultEnabled"));
+    auto *defaultValues = new QStackedWidget(&dialog);
+    auto *scalarDefault = new QLineEdit(defaultValues);
+    scalarDefault->setObjectName(QStringLiteral("fieldDefaultScalar"));
+    scalarDefault->setMaxLength(50000);
+    scalarDefault->setPlaceholderText(QStringLiteral("Default value"));
+    defaultValues->addWidget(scalarDefault);
+    auto *booleanDefault = new QComboBox(defaultValues);
+    booleanDefault->setObjectName(QStringLiteral("fieldDefaultBoolean"));
+    booleanDefault->addItem(QStringLiteral("True"), true);
+    booleanDefault->addItem(QStringLiteral("False"), false);
+    defaultValues->addWidget(booleanDefault);
+    auto *progressDefault = new QWidget(defaultValues);
+    auto *progressDefaultLayout = new QHBoxLayout(progressDefault);
+    progressDefaultLayout->setContentsMargins(0, 0, 0, 0);
+    auto *defaultCurrent = new QLineEdit(progressDefault);
+    defaultCurrent->setObjectName(QStringLiteral("fieldDefaultProgressCurrent"));
+    defaultCurrent->setValidator(new QDoubleValidator(defaultCurrent));
+    defaultCurrent->setPlaceholderText(QStringLiteral("Current"));
+    auto *defaultMaximum = new QLineEdit(progressDefault);
+    defaultMaximum->setObjectName(QStringLiteral("fieldDefaultProgressMaximum"));
+    defaultMaximum->setValidator(new QDoubleValidator(defaultMaximum));
+    defaultMaximum->setPlaceholderText(QStringLiteral("Maximum"));
+    progressDefaultLayout->addWidget(defaultCurrent);
+    progressDefaultLayout->addWidget(defaultMaximum);
+    defaultValues->addWidget(progressDefault);
+    auto *defaultRow = new QWidget(&dialog);
+    defaultRow->setObjectName(QStringLiteral("fieldDefaultRow"));
+    auto *defaultRowLayout = new QHBoxLayout(defaultRow);
+    defaultRowLayout->setContentsMargins(0, 0, 0, 0);
+    defaultRowLayout->addWidget(defaultEnabled);
+    defaultRowLayout->addWidget(defaultValues, 1);
+    defaultValues->setEnabled(false);
+    connect(defaultEnabled, &QCheckBox::toggled, defaultValues, &QWidget::setEnabled);
+    form->addRow(QStringLiteral("Default"), defaultRow);
     auto *choicesLabel = textLabel(QStringLiteral("Choices (one per line)"));
     auto *choices = new QTextEdit(&dialog);
     choices->setPlaceholderText(QStringLiteral("Common\nUncommon\nRare"));
@@ -1471,22 +1613,190 @@ void MainWindow::openCreateField(const QString &typeId)
     targetType->addItem(QStringLiteral("Any type in this game"), QString());
     for (const ObjectType &target : std::as_const(m_types)) targetType->addItem(target.name, target.id);
     form->addRow(QStringLiteral("Allowed reference type"), targetType);
-    auto updateOptions = [kind, choicesLabel, choices, targetType] {
+    auto *formulaLabel = textLabel(QStringLiteral("Expression (use @{field-id} to refer to a field)"), {}, &dialog);
+    auto *formulaExpression = new QTextEdit(&dialog);
+    formulaExpression->setObjectName(QStringLiteral("formulaExpression"));
+    formulaExpression->setPlaceholderText(QStringLiteral("(@{field-id} + 2) * 3"));
+    formulaExpression->setMaximumHeight(82);
+    form->addRow(formulaLabel, formulaExpression);
+    auto *formulaInsert = new QComboBox(&dialog);
+    formulaInsert->setObjectName(QStringLiteral("formulaInsertField"));
+    formulaInsert->addItem(QStringLiteral("Insert numeric field…"), QString());
+    for (const FieldDefinition &field : typeIt->fields) {
+        if (!field.archived && (field.fieldType == QStringLiteral("integer") || field.fieldType == QStringLiteral("decimal") ||
+            field.fieldType == QStringLiteral("percentage") || field.fieldType == QStringLiteral("progress") || field.fieldType == QStringLiteral("formula")))
+            formulaInsert->addItem(QStringLiteral("%1 · %2").arg(field.name, field.id), field.id);
+    }
+    form->addRow(QStringLiteral("Insert field reference"), formulaInsert);
+    connect(formulaInsert, &QComboBox::currentIndexChanged, &dialog, [formulaInsert, formulaExpression](int index) {
+        const QString id = formulaInsert->itemData(index).toString();
+        if (id.isEmpty()) return;
+        QTextCursor cursor = formulaExpression->textCursor();
+        cursor.insertText(QStringLiteral("@{%1}").arg(id));
+        formulaExpression->setTextCursor(cursor);
+        formulaInsert->setCurrentIndex(0);
+    });
+
+    auto *aggregationRelation = new QComboBox(&dialog);
+    aggregationRelation->setObjectName(QStringLiteral("formulaAggregationRelation"));
+    aggregationRelation->addItem(QStringLiteral("No relationship aggregation"), QString());
+    for (const FieldDefinition &field : typeIt->fields) {
+        if (!field.archived && (field.fieldType == QStringLiteral("reference") || field.fieldType == QStringLiteral("references")))
+            aggregationRelation->addItem(QStringLiteral("%1 · %2").arg(field.name, field.id), field.id);
+    }
+    form->addRow(QStringLiteral("Aggregate related objects"), aggregationRelation);
+    auto *aggregationOperation = new QComboBox(&dialog);
+    aggregationOperation->setObjectName(QStringLiteral("formulaAggregationOperation"));
+    for (const auto &entry : QList<QPair<QString, QString>>{
+             {QStringLiteral("Sum"), QStringLiteral("sum")}, {QStringLiteral("Average"), QStringLiteral("avg")},
+             {QStringLiteral("Minimum"), QStringLiteral("min")}, {QStringLiteral("Maximum"), QStringLiteral("max")},
+             {QStringLiteral("Count"), QStringLiteral("count")}})
+        aggregationOperation->addItem(entry.first, entry.second);
+    form->addRow(QStringLiteral("Operation"), aggregationOperation);
+    auto *aggregationField = new QComboBox(&dialog);
+    aggregationField->setObjectName(QStringLiteral("formulaAggregationField"));
+    aggregationField->addItem(QStringLiteral("Choose numeric target field…"), QString());
+    for (const ObjectType &target : std::as_const(m_types)) {
+        for (const FieldDefinition &field : target.fields) {
+            if (!field.archived && (field.fieldType == QStringLiteral("integer") || field.fieldType == QStringLiteral("decimal") ||
+                field.fieldType == QStringLiteral("percentage") || field.fieldType == QStringLiteral("progress")))
+                aggregationField->addItem(QStringLiteral("%1 · %2").arg(target.name, field.name), field.id);
+        }
+    }
+    form->addRow(QStringLiteral("Target numeric field"), aggregationField);
+    auto *sampleObject = new QComboBox(&dialog);
+    sampleObject->setObjectName(QStringLiteral("formulaPreviewObject"));
+    sampleObject->addItem(QStringLiteral("Choose an example object…"), QString());
+    for (const ObjectRecord &object : m_objects) if (object.typeId == typeId)
+        sampleObject->addItem(object.name, object.id);
+    form->addRow(QStringLiteral("Preview with object"), sampleObject);
+    auto *formulaPreview = textLabel(QStringLiteral("Enter an expression and choose an example object for a live preview."), {}, &dialog);
+    formulaPreview->setObjectName(QStringLiteral("formulaPreview"));
+    formulaPreview->setStyleSheet(QStringLiteral("color:#715c74;font-size:11px;"));
+    form->addRow(QStringLiteral("Preview"), formulaPreview);
+    auto refreshAggregationFields = [this, typeId, aggregationRelation, aggregationOperation, aggregationField] {
+        const QString relationId = aggregationRelation->currentData().toString();
+        const QString selectedId = aggregationField->currentData().toString();
+        QString allowedType;
+        const auto sourceType = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == typeId; });
+        if (sourceType != m_types.cend()) {
+            const auto relation = std::find_if(sourceType->fields.cbegin(), sourceType->fields.cend(), [&](const FieldDefinition &field) { return field.id == relationId; });
+            if (relation != sourceType->fields.cend()) allowedType = relation->options.value(QStringLiteral("allowed_type_id")).toString();
+        }
+        aggregationField->clear();
+        aggregationField->addItem(QStringLiteral("Choose numeric target field…"), QString());
+        for (const ObjectType &target : std::as_const(m_types)) {
+            if (!allowedType.isEmpty() && target.id != allowedType) continue;
+            for (const FieldDefinition &field : target.fields) {
+                if (!field.archived && (field.fieldType == QStringLiteral("integer") || field.fieldType == QStringLiteral("decimal") ||
+                    field.fieldType == QStringLiteral("percentage") || field.fieldType == QStringLiteral("progress")))
+                    aggregationField->addItem(QStringLiteral("%1 · %2").arg(target.name, field.name), field.id);
+            }
+        }
+        const int selectedIndex = aggregationField->findData(selectedId);
+        if (selectedIndex >= 0) aggregationField->setCurrentIndex(selectedIndex);
+        const bool aggregationEnabled = !relationId.isEmpty();
+        aggregationOperation->setVisible(aggregationEnabled);
+        aggregationField->setVisible(aggregationEnabled && aggregationOperation->currentData().toString() != QStringLiteral("count"));
+    };
+    connect(aggregationRelation, &QComboBox::currentIndexChanged, &dialog, refreshAggregationFields);
+    connect(aggregationOperation, &QComboBox::currentIndexChanged, &dialog, [refreshAggregationFields] { refreshAggregationFields(); });
+    auto updateFormulaPreview = [this, typeId, formulaExpression, aggregationRelation, aggregationOperation,
+                                 aggregationField, sampleObject, formulaPreview] {
+        const QString expression = formulaExpression->toPlainText();
+        QString syntaxError;
+        if (!FormulaEvaluator::validateExpression(expression, &syntaxError)) {
+            formulaPreview->setText(syntaxError.isEmpty() ? QStringLiteral("Formula preview is waiting for a valid expression.") : syntaxError);
+            return;
+        }
+        const QString objectId = sampleObject->currentData().toString();
+        if (objectId.isEmpty()) {
+            formulaPreview->setText(QStringLiteral("Choose an example object to calculate this expression."));
+            return;
+        }
+        QJsonObject options{{QStringLiteral("expression"), expression}};
+        if (!aggregationRelation->currentData().toString().isEmpty()) {
+            QJsonObject aggregation{{QStringLiteral("relationship_field_id"), aggregationRelation->currentData().toString()},
+                                    {QStringLiteral("operation"), aggregationOperation->currentData().toString()}};
+            if (aggregationOperation->currentData().toString() != QStringLiteral("count"))
+                aggregation.insert(QStringLiteral("field_id"), aggregationField->currentData().toString());
+            options.insert(QStringLiteral("aggregation"), aggregation);
+        }
+        QVector<ObjectRecord> objects = m_repository.objects(m_selectedGameId);
+        const auto found = std::find_if(objects.begin(), objects.end(), [&](const ObjectRecord &item) { return item.id == objectId; });
+        if (found == objects.end()) {
+            formulaPreview->setText(QStringLiteral("The example object is no longer available. Refresh and try again."));
+            return;
+        }
+        QVector<ObjectType> types = m_repository.objectTypes(m_selectedGameId);
+        auto type = std::find_if(types.begin(), types.end(), [&](const ObjectType &item) { return item.id == typeId; });
+        if (type == types.end()) return;
+        FieldDefinition candidate;
+        candidate.id = QStringLiteral("__preview_formula__");
+        candidate.objectTypeId = typeId;
+        candidate.name = QStringLiteral("Formula preview");
+        candidate.fieldType = QStringLiteral("formula");
+        candidate.options = options;
+        type->fields.append(candidate);
+        found->formulaErrors.remove(candidate.id);
+        FormulaEvaluator::evaluate(type->fields, *found, types, objects);
+        const auto failure = found->formulaErrors.constFind(candidate.id);
+        if (failure != found->formulaErrors.cend()) formulaPreview->setText(QStringLiteral("Preview error: %1").arg(failure.value()));
+        else formulaPreview->setText(QStringLiteral("Result: %1").arg(found->values.value(candidate.id).toDouble(), 0, 'g', 12));
+    };
+    connect(formulaExpression, &QTextEdit::textChanged, &dialog, updateFormulaPreview);
+    connect(aggregationRelation, &QComboBox::currentIndexChanged, &dialog, updateFormulaPreview);
+    connect(aggregationOperation, &QComboBox::currentIndexChanged, &dialog, updateFormulaPreview);
+    connect(aggregationField, &QComboBox::currentIndexChanged, &dialog, updateFormulaPreview);
+    connect(sampleObject, &QComboBox::currentIndexChanged, &dialog, updateFormulaPreview);
+
+    auto updateOptions = [kind, choicesLabel, choices, targetType, formulaLabel, formulaExpression,
+                          formulaInsert, aggregationRelation, aggregationOperation, aggregationField, sampleObject, formulaPreview] {
         const QString selected = kind->currentData().toString();
         const bool select = selected == QStringLiteral("select");
         const bool references = selected == QStringLiteral("reference") || selected == QStringLiteral("references");
+        const bool formula = selected == QStringLiteral("formula");
         choicesLabel->setVisible(select);
         choices->setVisible(select);
         targetType->setVisible(references);
+        const QList<QWidget *> formulaWidgets{formulaLabel, formulaExpression, formulaInsert, aggregationRelation,
+            aggregationOperation, aggregationField, sampleObject, formulaPreview};
+        for (QWidget *widget : formulaWidgets) widget->setVisible(formula);
+        aggregationOperation->setVisible(formula && !aggregationRelation->currentData().toString().isEmpty());
+        aggregationField->setVisible(formula && !aggregationRelation->currentData().toString().isEmpty() &&
+            aggregationOperation->currentData().toString() != QStringLiteral("count"));
     };
-    connect(kind, &QComboBox::currentIndexChanged, &dialog, [updateOptions] { updateOptions(); });
+    auto updateDefaultInput = [kind, defaultRow, defaultValues, defaultEnabled, scalarDefault, defaultCurrent, defaultMaximum] {
+        const QString fieldType = kind->currentData().toString();
+        const bool unsupported = fieldType == QStringLiteral("formula") || fieldType == QStringLiteral("reference") || fieldType == QStringLiteral("references");
+        defaultRow->setVisible(!unsupported);
+        if (unsupported) defaultEnabled->setChecked(false);
+        if (fieldType == QStringLiteral("boolean")) defaultValues->setCurrentIndex(1);
+        else if (fieldType == QStringLiteral("progress")) defaultValues->setCurrentIndex(2);
+        else defaultValues->setCurrentIndex(0);
+        scalarDefault->setValidator(nullptr);
+        if (fieldType == QStringLiteral("integer")) scalarDefault->setValidator(new QIntValidator(scalarDefault));
+        else if (fieldType == QStringLiteral("percentage")) scalarDefault->setValidator(new QDoubleValidator(0, 100, 8, scalarDefault));
+        else if (fieldType == QStringLiteral("decimal")) scalarDefault->setValidator(new QDoubleValidator(scalarDefault));
+        scalarDefault->setPlaceholderText(fieldType == QStringLiteral("date") ? QStringLiteral("YYYY-MM-DD")
+            : fieldType == QStringLiteral("select") ? QStringLiteral("One of the choices above")
+            : QStringLiteral("Default value"));
+        Q_UNUSED(defaultCurrent);
+        Q_UNUSED(defaultMaximum);
+    };
+    connect(kind, &QComboBox::currentIndexChanged, &dialog, [updateOptions, updateDefaultInput] {
+        updateOptions();
+        updateDefaultInput();
+    });
     layout->addLayout(form);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
     auto *save = buttons->addButton(QStringLiteral("Add Field"), QDialogButtonBox::AcceptRole);
     save->setObjectName(QStringLiteral("goldButton"));
     layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, typeId, name, kind, icon, choices, targetType] {
+    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, typeId, name, kind, icon, description, choices, targetType,
+                                                   defaultEnabled, scalarDefault, booleanDefault, defaultCurrent, defaultMaximum,
+                                                   formulaExpression, aggregationRelation, aggregationOperation, aggregationField] {
         if (name->text().trimmed().isEmpty()) {
             QMessageBox::warning(&dialog, QStringLiteral("Field name required"), QStringLiteral("Enter a name for this field."));
             name->setFocus();
@@ -1521,14 +1831,62 @@ void MainWindow::openCreateField(const QString &typeId)
             const QString allowed = targetType->currentData().toString();
             if (!allowed.isEmpty()) options.insert(QStringLiteral("allowed_type_id"), allowed);
         }
+        if (fieldType == QStringLiteral("formula")) {
+            options.insert(QStringLiteral("expression"), formulaExpression->toPlainText());
+            const QString relationshipId = aggregationRelation->currentData().toString();
+            if (!relationshipId.isEmpty()) {
+                QJsonObject aggregation{{QStringLiteral("relationship_field_id"), relationshipId},
+                                        {QStringLiteral("operation"), aggregationOperation->currentData().toString()}};
+                if (aggregationOperation->currentData().toString() != QStringLiteral("count")) {
+                    const QString fieldId = aggregationField->currentData().toString();
+                    if (fieldId.isEmpty()) {
+                        QMessageBox::warning(&dialog, QStringLiteral("Target field required"), QStringLiteral("Choose a numeric target field for this aggregation."));
+                        return;
+                    }
+                    aggregation.insert(QStringLiteral("field_id"), fieldId);
+                }
+                options.insert(QStringLiteral("aggregation"), aggregation);
+            }
+        }
+        QJsonValue defaultValue;
+        if (defaultEnabled->isChecked()) {
+            if (fieldType == QStringLiteral("boolean")) {
+                defaultValue = QJsonValue(booleanDefault->currentData().toBool());
+            } else if (fieldType == QStringLiteral("progress")) {
+                bool currentOkay = false;
+                bool maximumOkay = false;
+                const double current = defaultCurrent->text().trimmed().toDouble(&currentOkay);
+                const double maximum = defaultMaximum->text().trimmed().toDouble(&maximumOkay);
+                if (!currentOkay || !maximumOkay) {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid progress default"), QStringLiteral("Enter both a current value and a maximum."));
+                    return;
+                }
+                defaultValue = QJsonObject{{QStringLiteral("current"), current}, {QStringLiteral("max"), maximum}};
+            } else if (fieldType == QStringLiteral("integer") || fieldType == QStringLiteral("decimal") ||
+                       fieldType == QStringLiteral("percentage")) {
+                bool okay = false;
+                const double value = scalarDefault->text().trimmed().toDouble(&okay);
+                if (!okay || (fieldType == QStringLiteral("integer") && std::floor(value) != value)) {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid default"), QStringLiteral("Enter a valid numeric default for this field."));
+                    return;
+                }
+                defaultValue = value;
+            } else {
+                defaultValue = scalarDefault->text();
+            }
+        }
         QString error;
-        if (!m_repository.createField(typeId, name->text(), fieldType, icon->text(), options, nullptr, &error)) {
+        if (!m_repository.createField(typeId, name->text(), fieldType, icon->text(), options, nullptr, &error,
+                                      description->text(), defaultValue)) {
             QMessageBox::warning(&dialog, QStringLiteral("Could not add field"), error);
             return;
         }
         dialog.accept();
     });
     updateOptions();
+    updateDefaultInput();
+    refreshAggregationFields();
+    updateFormulaPreview();
     name->setFocus();
     if (dialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
 }
@@ -1566,8 +1924,25 @@ void MainWindow::openObjectEditor(const QString &objectId)
     name->setMaxLength(160);
     auto *description = new QLineEdit(editing ? original.description : QString(), body);
     description->setMaxLength(500);
+    auto *image = new QLineEdit(editing ? original.image : QString(), body);
+    image->setObjectName(QStringLiteral("objectImageInput"));
+    image->setReadOnly(true);
+    auto *imageRow = new QWidget(body);
+    auto *imageLayout = new QHBoxLayout(imageRow);
+    imageLayout->setContentsMargins(0, 0, 0, 0);
+    imageLayout->addWidget(image, 1);
+    auto *chooseImage = button(QStringLiteral("Choose…"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(chooseImage);
+    auto *clearImage = button(QStringLiteral("Clear"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(clearImage);
+    connect(clearImage, &QPushButton::clicked, &dialog, [image] { image->clear(); });
+    connect(chooseImage, &QPushButton::clicked, &dialog, [this, &dialog, image] {
+        const QString reference = openAssetLibrary(&dialog, image->text());
+        if (!reference.isNull()) image->setText(reference);
+    });
     metadata->addRow(QStringLiteral("Object name"), name);
     metadata->addRow(QStringLiteral("Description"), description);
+    metadata->addRow(QStringLiteral("Image"), imageRow);
     auto *typeChoice = new QComboBox(body);
     for (const ObjectType &type : std::as_const(m_types)) typeChoice->addItem(type.name, type.id);
     if (editing) {
@@ -1712,7 +2087,12 @@ void MainWindow::openObjectEditor(const QString &objectId)
                 input->setSelectionMode(QAbstractItemView::MultiSelection);
                 control = input;
             } else {
-                auto *calculated = textLabel(QStringLiteral("Formula evaluation is not available in this desktop milestone."));
+                QString formulaStatus = QStringLiteral("Calculated from this object's saved values.");
+                if (editing && original.formulaErrors.contains(field.id))
+                    formulaStatus = QStringLiteral("Formula error: %1").arg(original.formulaErrors.value(field.id));
+                else if (editing && original.values.contains(field.id))
+                    formulaStatus = QStringLiteral("Calculated value: %1").arg(original.values.value(field.id).toDouble(), 0, 'g', 12);
+                auto *calculated = textLabel(formulaStatus);
                 calculated->setStyleSheet(QStringLiteral("color:#715c74;font-size:11px;"));
                 calculated->setEnabled(false);
                 control = calculated;
@@ -1732,7 +2112,7 @@ void MainWindow::openObjectEditor(const QString &objectId)
     save->setObjectName(QStringLiteral("goldButton"));
     outer->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, editing, &original, name, description, typeChoice, &controls] {
+    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, editing, &original, name, description, image, typeChoice, &controls] {
         if (name->text().trimmed().isEmpty()) {
             QMessageBox::warning(&dialog, QStringLiteral("Object name required"), QStringLiteral("Enter a name for this object."));
             name->setFocus();
@@ -1743,6 +2123,7 @@ void MainWindow::openObjectEditor(const QString &objectId)
         object.typeId = typeChoice->currentData().toString();
         object.name = name->text();
         object.description = description->text();
+        object.image = image->text();
         const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == object.typeId; });
         if (typeIt == m_types.cend()) {
             QMessageBox::warning(&dialog, QStringLiteral("Object type missing"), QStringLiteral("Select an active object type."));
@@ -2033,6 +2414,128 @@ void MainWindow::openGoalEditor(const QString &goalId)
     }
 }
 
+QString MainWindow::openAssetLibrary(QWidget *parent, const QString &currentReference, bool selectionMode)
+{
+    QDialog dialog(parent);
+    dialog.setWindowTitle(selectionMode ? QStringLiteral("Choose Image") : QStringLiteral("Uploaded Images"));
+    dialog.setMinimumSize(560, 440);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *summary = textLabel(QStringLiteral("Loading image library…"), {}, &dialog);
+    layout->addWidget(summary);
+    auto *list = new QListWidget(&dialog);
+    list->setObjectName(QStringLiteral("uploadedAssetsList"));
+    list->setViewMode(QListView::IconMode);
+    list->setIconSize(QSize(72, 72));
+    list->setResizeMode(QListView::Adjust);
+    list->setMovement(QListView::Static);
+    list->setSelectionMode(QAbstractItemView::SingleSelection);
+    layout->addWidget(list, 1);
+    auto *actions = new QHBoxLayout();
+    auto *upload = button(QStringLiteral("Upload Image"), QStringLiteral("goldButton"), &dialog);
+    upload->setObjectName(QStringLiteral("uploadAssetButton"));
+    auto *remove = button(QStringLiteral("Delete"), QStringLiteral("softButton"), &dialog);
+    auto *retry = button(QStringLiteral("Retry Cleanup"), QStringLiteral("softButton"), &dialog);
+    actions->addWidget(upload);
+    actions->addWidget(remove);
+    actions->addWidget(retry);
+    actions->addStretch(1);
+    QPushButton *choose = nullptr;
+    if (selectionMode) {
+        choose = button(QStringLiteral("Use Selected"), QStringLiteral("goldButton"), &dialog);
+        choose->setObjectName(QStringLiteral("useSelectedAssetButton"));
+        choose->setEnabled(false);
+        actions->addWidget(choose);
+    }
+    auto *close = button(selectionMode ? QStringLiteral("Cancel") : QStringLiteral("Close"), QStringLiteral("softButton"), &dialog);
+    actions->addWidget(close);
+    layout->addLayout(actions);
+
+    auto refresh = [this, list, summary, currentReference] {
+        list->clear();
+        QString error;
+        const QVector<UploadedAsset> assets = m_repository.uploadedAssets(&error);
+        if (!error.isEmpty()) summary->setText(QStringLiteral("Image library warning: %1").arg(error));
+        else summary->setText(QStringLiteral("%1 images · quota: 1000 files / 250 MB. Pending deletions remain counted until cleanup succeeds.").arg(assets.size()));
+        for (const UploadedAsset &asset : assets) {
+            auto *item = new QListWidgetItem(QStringLiteral("%1\n%2 · %3")
+                .arg(asset.pendingDeletion ? QStringLiteral("Pending deletion") : asset.id.left(8),
+                     QString::number(asset.sizeBytes / 1024.0, 'f', 1) + QStringLiteral(" KB"),
+                     asset.pendingDeletion ? QStringLiteral("cleanup queued") : QStringLiteral("PNG")), list);
+            item->setData(Qt::UserRole, asset.reference);
+            item->setData(Qt::UserRole + 1, asset.id);
+            item->setData(Qt::UserRole + 2, asset.pendingDeletion);
+            item->setTextAlignment(Qt::AlignHCenter | Qt::AlignBottom);
+            if (!asset.pendingDeletion) {
+                const QImage image = m_repository.loadAssetImage(asset.reference);
+                if (!image.isNull()) item->setIcon(QIcon(QPixmap::fromImage(image)));
+            }
+            item->setToolTip(asset.reference);
+            if (asset.reference == currentReference) list->setCurrentItem(item);
+        }
+    };
+    refresh();
+    if (choose) connect(list, &QListWidget::currentItemChanged, &dialog, [choose](QListWidgetItem *current) {
+        choose->setEnabled(current && !current->data(Qt::UserRole + 2).toBool());
+    });
+    if (choose && list->currentItem())
+        choose->setEnabled(!list->currentItem()->data(Qt::UserRole + 2).toBool());
+    connect(upload, &QPushButton::clicked, &dialog, [this, &dialog, refresh] {
+        const QString formats = ImageDecoder::supportsWebp()
+            ? QStringLiteral("Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)")
+            : QStringLiteral("Images (*.png *.jpg *.jpeg *.gif *.bmp)");
+        const QString filename = QFileDialog::getOpenFileName(&dialog, QStringLiteral("Upload Image"), {}, formats);
+        if (filename.isEmpty()) return;
+        QFile file(filename);
+        if (!file.open(QIODevice::ReadOnly)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not read image"), file.errorString());
+            return;
+        }
+        const QByteArray encoded = file.read(5 * 1024 * 1024 + 1);
+        if (file.error() != QFileDevice::NoError) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not read image"), file.errorString());
+            return;
+        }
+        UploadedAsset created;
+        QString error;
+        if (!m_repository.uploadAsset(encoded, &created, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not upload image"), error);
+            return;
+        }
+        refresh();
+    });
+    connect(remove, &QPushButton::clicked, &dialog, [this, &dialog, list, refresh] {
+        QListWidgetItem *item = list->currentItem();
+        if (!item) return;
+        if (QMessageBox::question(&dialog, QStringLiteral("Delete image"),
+            QStringLiteral("Delete this image? Images used by active or archived records are protected.")) != QMessageBox::Yes) return;
+        bool pending = false;
+        QString error;
+        if (!m_repository.deleteAsset(item->data(Qt::UserRole + 1).toString(), &pending, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not delete image"), error);
+            return;
+        }
+        if (pending) QMessageBox::information(&dialog, QStringLiteral("Cleanup queued"), error);
+        refresh();
+    });
+    connect(retry, &QPushButton::clicked, &dialog, [this, &dialog, refresh] {
+        QString error;
+        if (!m_repository.retryAssetCleanup(&error)) QMessageBox::warning(&dialog, QStringLiteral("Cleanup still pending"), error);
+        refresh();
+    });
+    QString selected;
+    if (choose) connect(choose, &QPushButton::clicked, &dialog, [&dialog, list, &selected] {
+        if (QListWidgetItem *item = list->currentItem()) {
+            if (!item->data(Qt::UserRole + 2).toBool()) {
+                selected = item->data(Qt::UserRole).toString();
+                dialog.accept();
+            }
+        }
+    });
+    connect(close, &QPushButton::clicked, &dialog, &QDialog::reject);
+    dialog.exec();
+    return selected;
+}
+
 void MainWindow::openProfile()
 {
     QDialog dialog(this);
@@ -2134,7 +2637,17 @@ void MainWindow::openProfile()
         }
         bodyLayout->addWidget(box);
     }
-    addSection(QStringLiteral("Uploaded Images"), QStringLiteral("Image uploads and quota management are not available yet."));
+    auto *imageBox = panel(QStringLiteral(""));
+    imageBox->setObjectName(QStringLiteral("settingsSection"));
+    imageBox->setStyleSheet(QStringLiteral("QFrame#settingsSection { background:#fffaf2; border:1px solid #d8c9b9; }"));
+    auto *imageLayout = new QVBoxLayout(imageBox);
+    imageLayout->setContentsMargins(11, 9, 11, 9);
+    imageLayout->addWidget(textLabel(QStringLiteral("UPLOADED IMAGES")));
+    imageLayout->addWidget(textLabel(QStringLiteral("Manage image storage, quota, and pending cleanup. Images referenced by archived records stay protected.")));
+    auto *manageImages = button(QStringLiteral("Manage Images"), QStringLiteral("softButton"), imageBox);
+    imageLayout->addWidget(manageImages, 0, Qt::AlignLeft);
+    bodyLayout->addWidget(imageBox);
+    connect(manageImages, &QPushButton::clicked, &dialog, [this, &dialog] { openAssetLibrary(&dialog, {}, false); });
     bodyLayout->addStretch(1);
     scroll->setWidget(body);
     layout->addWidget(scroll, 1);

@@ -15,6 +15,7 @@ struct Game {
     QString description;
     QString icon;
     QString coverImage;
+    QString personalNotes;
     int objectCount = 0;
     int sectionCount = 0;
     int goalCount = 0;
@@ -49,6 +50,7 @@ struct ObjectType {
     QString name;
     QString description;
     QString icon;
+    QString image;
     QVector<FieldDefinition> fields;
 };
 
@@ -61,6 +63,7 @@ struct ObjectRecord {
     QString description;
     QString image;
     QMap<QString, QJsonValue> values;
+    QMap<QString, QString> formulaErrors;
     QMap<QString, QStringList> references;
     QStringList sectionIds;
 };
@@ -98,6 +101,13 @@ struct ArchivedEntry {
     QString kind;
     QString gameName;
     QString name;
+};
+
+struct UploadedAsset {
+    QString id;
+    QString reference;
+    qint64 sizeBytes = 0;
+    bool pendingDeletion = false;
 };
 
 } // namespace gmst

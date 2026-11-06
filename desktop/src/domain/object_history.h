@@ -30,6 +30,7 @@ struct HistoryFilter {
     QDate since;
     QDate until;
     int page = 0;
+    int limit = 0;
     static constexpr int pageSize = 20;
 };
 

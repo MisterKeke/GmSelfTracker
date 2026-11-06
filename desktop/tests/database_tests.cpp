@@ -1,10 +1,15 @@
 #include "infrastructure/database/game_repository.h"
 #include "infrastructure/database/migration_runner.h"
 #include "infrastructure/assets/image_decoder.h"
+#include "domain/formula_evaluator.h"
 
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QBuffer>
+#include <QDir>
+#include <QFile>
+#include <QImage>
 #include <QTemporaryDir>
 #include <QUuid>
 #include <QJsonArray>
@@ -151,6 +156,14 @@ private slots:
         QCOMPARE(second.events.size(), 1);
         QVERIFY(!second.hasMore);
         QCOMPARE(second.events.first().changes.first().fieldId, fieldId);
+        HistoryFilter chartFilter;
+        chartFilter.fieldId = fieldId;
+        chartFilter.limit = 100;
+        const HistoryPage chart = repository.objectHistory(object.id, chartFilter, &error);
+        QCOMPARE(chart.events.size(), 22);
+        QVERIFY(!chart.hasMore);
+        QCOMPARE(chart.events.first().changes.first().after.toDouble(), 21.0);
+        QCOMPARE(chart.events.last().changes.first().after.toDouble(), 0.0);
         QVERIFY(repository.archiveObject(object.id, &error));
         QVERIFY(repository.restoreArchivedEntry({object.id, QStringLiteral("Object"), {}, {}}, &error));
         filter = {};
@@ -266,6 +279,153 @@ private slots:
         const auto afterArchive = repository.objects(gameId, &error);
         QCOMPARE(afterArchive.size(), 1);
         QCOMPARE(afterArchive.first().references.value(relatedFieldId), QStringList{weapon.id});
+    }
+
+    void formulasUseStableFieldsDefaultsAggregationsAndReportErrors()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        GameRepository repository(directory.filePath(QStringLiteral("formulas.sqlite")));
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+        QString gameId;
+        QString typeId;
+        QVERIFY(repository.createGame(QStringLiteral("Formula game"), {}, {}, &gameId, &error));
+        QVERIFY(repository.createObjectType(gameId, QStringLiteral("Node"), {}, {}, &typeId, &error));
+        QString scoreId;
+        QString linksId;
+        QString bonusId;
+        QString enabledId;
+        QVERIFY(repository.createField(typeId, QStringLiteral("Score"), QStringLiteral("decimal"), {}, {}, &scoreId, &error));
+        QVERIFY(repository.createField(typeId, QStringLiteral("Bonus"), QStringLiteral("integer"), {}, {}, &bonusId, &error));
+        QVERIFY(repository.createField(typeId, QStringLiteral("Enabled"), QStringLiteral("boolean"), {}, {}, &enabledId, &error));
+        QVERIFY(repository.createField(typeId, QStringLiteral("Children"), QStringLiteral("references"), {},
+            QJsonObject{{QStringLiteral("allowed_type_id"), typeId}}, &linksId, &error));
+        QString doubledId;
+        QVERIFY(repository.createField(typeId, QStringLiteral("Doubled"), QStringLiteral("formula"), {},
+            QJsonObject{{QStringLiteral("expression"), QStringLiteral("@{%1} * 2").arg(scoreId)}}, &doubledId, &error));
+        QString derivedId;
+        QVERIFY(repository.createField(typeId, QStringLiteral("Derived"), QStringLiteral("formula"), {},
+            QJsonObject{{QStringLiteral("expression"), QStringLiteral("(@{%1} + 4) * 3 - 6 / 2").arg(doubledId)}}, &derivedId, &error));
+        QMap<QString, QString> aggregateIds;
+        for (const QString &operation : {QStringLiteral("sum"), QStringLiteral("avg"), QStringLiteral("min"),
+                                          QStringLiteral("max"), QStringLiteral("count")}) {
+            QJsonObject aggregation{{QStringLiteral("relationship_field_id"), linksId},
+                                   {QStringLiteral("operation"), operation}};
+            if (operation != QStringLiteral("count")) aggregation.insert(QStringLiteral("field_id"), scoreId);
+            QString createdFieldId;
+            QVERIFY2(repository.createField(typeId, operation + QStringLiteral(" linked score"), QStringLiteral("formula"), {},
+                QJsonObject{{QStringLiteral("expression"), QStringLiteral("@{related} + @{%1}").arg(scoreId)},
+                            {QStringLiteral("aggregation"), aggregation}},
+                &createdFieldId, &error), qPrintable(error));
+            aggregateIds.insert(operation + QStringLiteral("Formula"), createdFieldId);
+        }
+        QString defaultFormulaId;
+        QVERIFY(repository.createField(typeId, QStringLiteral("Default formula"), QStringLiteral("formula"), {},
+            QJsonObject{{QStringLiteral("expression"), QStringLiteral("@{%1} * 4").arg(bonusId)}}, &defaultFormulaId, &error));
+        const auto types = repository.objectTypes(gameId, &error);
+        QCOMPARE(types.size(), 1);
+
+        ObjectRecord firstChild;
+        firstChild.gameId = gameId;
+        firstChild.typeId = typeId;
+        firstChild.name = QStringLiteral("First child");
+        firstChild.values.insert(scoreId, 3);
+        QVERIFY2(repository.saveObject(firstChild, types.first().fields, {}, &error), qPrintable(error));
+        ObjectRecord secondChild;
+        secondChild.gameId = gameId;
+        secondChild.typeId = typeId;
+        secondChild.name = QStringLiteral("Second child");
+        secondChild.values.insert(scoreId, 10);
+        QVERIFY2(repository.saveObject(secondChild, types.first().fields, {}, &error), qPrintable(error));
+        ObjectRecord parent;
+        parent.gameId = gameId;
+        parent.typeId = typeId;
+        parent.name = QStringLiteral("Parent");
+        parent.values.insert(scoreId, 10);
+        parent.references.insert(linksId, {firstChild.id, secondChild.id});
+        QVERIFY2(repository.saveObject(parent, types.first().fields, {}, &error), qPrintable(error));
+
+        const QString defaultsConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), defaultsConnection);
+            database.setDatabaseName(repository.databasePath());
+            QVERIFY(database.open());
+            QSqlQuery defaults(database);
+            defaults.prepare(QStringLiteral("UPDATE field_definitions SET default_json=? WHERE id=?"));
+            defaults.addBindValue(QStringLiteral("0"));
+            defaults.addBindValue(bonusId);
+            QVERIFY(defaults.exec());
+            defaults.prepare(QStringLiteral("UPDATE field_definitions SET default_json=? WHERE id=?"));
+            defaults.addBindValue(QStringLiteral("false"));
+            defaults.addBindValue(enabledId);
+            QVERIFY(defaults.exec());
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(defaultsConnection);
+        ObjectRecord defaultsObject;
+        defaultsObject.gameId = gameId;
+        defaultsObject.typeId = typeId;
+        defaultsObject.name = QStringLiteral("Default values");
+        QVERIFY2(repository.saveObject(defaultsObject, types.first().fields, {}, &error), qPrintable(error));
+
+        auto loaded = repository.objects(gameId, &error);
+        auto parentIt = std::find_if(loaded.cbegin(), loaded.cend(), [&](const ObjectRecord &item) { return item.id == parent.id; });
+        QVERIFY(parentIt != loaded.cend());
+        QCOMPARE(parentIt->values.value(doubledId).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(derivedId).toDouble(), 69.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("sumFormula"))).toDouble(), 23.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("avgFormula"))).toDouble(), 16.5);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("minFormula"))).toDouble(), 13.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("maxFormula"))).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("countFormula"))).toDouble(), 12.0);
+        const auto defaultIt = std::find_if(loaded.cbegin(), loaded.cend(), [&](const ObjectRecord &item) { return item.id == defaultsObject.id; });
+        QVERIFY(defaultIt != loaded.cend());
+        QVERIFY(defaultIt->values.contains(bonusId));
+        QCOMPARE(defaultIt->values.value(bonusId).toDouble(), 0.0);
+        QVERIFY(defaultIt->values.value(enabledId).isBool());
+        QVERIFY(!defaultIt->values.value(enabledId).toBool());
+        QCOMPARE(defaultIt->values.value(defaultFormulaId).toDouble(), 0.0);
+        QVERIFY(defaultIt->formulaErrors.value(doubledId).contains(QStringLiteral("enter a value for Score"), Qt::CaseInsensitive));
+
+        QVERIFY(repository.archiveObject(firstChild.id, &error));
+        loaded = repository.objects(gameId, &error);
+        parentIt = std::find_if(loaded.cbegin(), loaded.cend(), [&](const ObjectRecord &item) { return item.id == parent.id; });
+        QVERIFY(parentIt != loaded.cend());
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("sumFormula"))).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("avgFormula"))).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("minFormula"))).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("maxFormula"))).toDouble(), 20.0);
+        QCOMPARE(parentIt->values.value(aggregateIds.value(QStringLiteral("countFormula"))).toDouble(), 11.0);
+
+        QVERIFY(repository.createField(typeId, QStringLiteral("Divide by zero"), QStringLiteral("formula"), {},
+            QJsonObject{{QStringLiteral("expression"), QStringLiteral("@{%1} / 0").arg(scoreId)}}, nullptr, &error));
+        const QString connection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+            database.setDatabaseName(repository.databasePath());
+            QVERIFY(database.open());
+            QSqlQuery cycle(database);
+            cycle.prepare(QStringLiteral("UPDATE field_definitions SET options_json=? WHERE id=?"));
+            cycle.addBindValue(QStringLiteral("{\"expression\":\"@{%1}\"}").arg(derivedId));
+            cycle.addBindValue(doubledId);
+            QVERIFY(cycle.exec());
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+        loaded = repository.objects(gameId, &error);
+        parentIt = std::find_if(loaded.cbegin(), loaded.cend(), [&](const ObjectRecord &item) { return item.id == parent.id; });
+        QVERIFY(parentIt != loaded.cend());
+        QVERIFY(parentIt->formulaErrors.value(doubledId).contains(QStringLiteral("circular"), Qt::CaseInsensitive));
+        const auto afterCycleTypes = repository.objectTypes(gameId, &error);
+        const auto afterCycleObjects = repository.objects(gameId, &error);
+        const auto parentAfterCycle = std::find_if(afterCycleObjects.cbegin(), afterCycleObjects.cend(), [&](const ObjectRecord &item) { return item.id == parent.id; });
+        QVERIFY(parentAfterCycle != afterCycleObjects.cend());
+        const auto zeroDivision = std::find_if(afterCycleTypes.first().fields.cbegin(), afterCycleTypes.first().fields.cend(), [](const FieldDefinition &field) {
+            return field.name == QStringLiteral("Divide by zero");
+        });
+        QVERIFY(zeroDivision != afterCycleTypes.first().fields.cend());
+        QVERIFY(parentAfterCycle->formulaErrors.value(zeroDivision->id).contains(QStringLiteral("division by zero"), Qt::CaseInsensitive));
     }
 
     void goalsChecklistProgressAndDependenciesRemainConsistent()
@@ -440,6 +600,249 @@ private slots:
         QString error;
         QVERIFY(ImageDecoder::decode(oversized, &error).isNull());
         QVERIFY(error.contains(QStringLiteral("5 MB")));
+    }
+
+    void objectReadsUseTypedDefaultsWithoutOverwritingStoredValues()
+    {
+        QTemporaryDir directory;
+        GameRepository repository(directory.filePath(QStringLiteral("defaults.sqlite")));
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+        QString gameId;
+        QString typeId;
+        QVERIFY(repository.createGame(QStringLiteral("Defaults"), {}, {}, &gameId, &error));
+        QVERIFY(repository.createObjectType(gameId, QStringLiteral("Entry"), {}, {}, &typeId, &error));
+
+        QString boolId;
+        QString zeroId;
+        QString textId;
+        QString progressId;
+        QVERIFY2(repository.createField(typeId, QStringLiteral("Enabled"), QStringLiteral("boolean"), {}, {},
+            &boolId, &error, QStringLiteral("Enabled by default"), QJsonValue(false)), qPrintable(error));
+        QVERIFY2(repository.createField(typeId, QStringLiteral("Count"), QStringLiteral("integer"), {}, {},
+            &zeroId, &error, {}, QJsonValue(0)), qPrintable(error));
+        QVERIFY2(repository.createField(typeId, QStringLiteral("Label"), QStringLiteral("text"), {}, {},
+            &textId, &error, {}, QJsonValue(QStringLiteral("Starter"))), qPrintable(error));
+        QVERIFY2(repository.createField(typeId, QStringLiteral("Progress"), QStringLiteral("progress"), {}, {},
+            &progressId, &error, {}, QJsonObject{{QStringLiteral("current"), 0}, {QStringLiteral("max"), 10}}), qPrintable(error));
+        QVERIFY(!repository.createField(typeId, QStringLiteral("Invalid percentage"), QStringLiteral("percentage"), {}, {},
+            nullptr, &error, {}, QJsonValue(101)));
+        QVERIFY(error.contains(QStringLiteral("between 0 and 100")));
+
+        ObjectRecord object;
+        object.gameId = gameId;
+        object.typeId = typeId;
+        object.name = QStringLiteral("Uses defaults");
+        auto types = repository.objectTypes(gameId, &error);
+        QVERIFY2(repository.saveObject(object, types.first().fields, {}, &error), qPrintable(error));
+        auto objects = repository.objects(gameId, &error);
+        QCOMPARE(objects.size(), 1);
+        QCOMPARE(objects.first().values.value(boolId).isBool(), true);
+        QCOMPARE(objects.first().values.value(boolId).toBool(), false);
+        QCOMPARE(objects.first().values.value(zeroId).toDouble(), 0.0);
+        QCOMPARE(objects.first().values.value(textId).toString(), QStringLiteral("Starter"));
+        QCOMPARE(objects.first().values.value(progressId).toObject().value(QStringLiteral("max")).toDouble(), 10.0);
+
+        ObjectRecord explicitValues = objects.first();
+        explicitValues.values[boolId] = false;
+        explicitValues.values[zeroId] = 0;
+        QVERIFY2(repository.saveObject(explicitValues, types.first().fields, {}, &error), qPrintable(error));
+        objects = repository.objects(gameId, &error);
+        QCOMPARE(objects.first().values.value(boolId).toBool(), false);
+        QCOMPARE(objects.first().values.value(zeroId).toDouble(), 0.0);
+        const QString connection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+            database.setDatabaseName(repository.databasePath());
+            QVERIFY(database.open());
+            QSqlQuery stored(database);
+            stored.prepare(QStringLiteral("SELECT field_id,value_json FROM field_values WHERE object_id=?"));
+            stored.addBindValue(object.id);
+            QVERIFY(stored.exec());
+            QMap<QString, QString> raw;
+            while (stored.next()) raw.insert(stored.value(0).toString(), stored.value(1).toString());
+            QCOMPARE(raw.value(boolId), QStringLiteral("false"));
+            QCOMPARE(raw.value(zeroId), QStringLiteral("0"));
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+    }
+
+    void assetStorageEnforcesOwnershipQuotaReferencesAndRetry()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString databasePath = directory.filePath(QStringLiteral("assets.sqlite"));
+        GameRepository repository(databasePath);
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+
+        auto encode = [](const QByteArray &format) {
+            QImage source(8, 8, QImage::Format_ARGB32);
+            source.fill(QColor(120, 45, 200));
+            QByteArray bytes;
+            QBuffer buffer(&bytes);
+            if (!buffer.open(QIODevice::WriteOnly) || !source.save(&buffer, format.constData())) return QByteArray();
+            return bytes;
+        };
+        const QByteArray png = encode("PNG");
+        const QByteArray jpeg = encode("JPEG");
+        const QByteArray bmp = encode("BMP");
+        QVERIFY(!png.isEmpty());
+        QVERIFY(!jpeg.isEmpty());
+        QVERIFY(!bmp.isEmpty());
+
+        UploadedAsset cover;
+        QVERIFY2(repository.uploadAsset(png, &cover, &error), qPrintable(error));
+        QCOMPARE(cover.reference, QStringLiteral("/api/assets/") + cover.id);
+        QVERIFY(!repository.loadAssetImage(cover.reference, &error).isNull());
+        UploadedAsset converted;
+        QVERIFY2(repository.uploadAsset(jpeg, &converted, &error), qPrintable(error));
+        QVERIFY(!repository.loadAssetImage(converted.reference, &error).isNull());
+        UploadedAsset bitmap;
+        QVERIFY2(repository.uploadAsset(bmp, &bitmap, &error), qPrintable(error));
+        QVERIFY(!repository.loadAssetImage(bitmap.reference, &error).isNull());
+        QVERIFY(!repository.uploadAsset(QByteArray("not an image"), nullptr, &error));
+        QVERIFY(!repository.uploadAsset(QByteArray(ImageDecoder::maximumBytes + 1, '\0'), nullptr, &error));
+
+        const QString pathConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase pathDb = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), pathConnection);
+            pathDb.setDatabaseName(databasePath);
+            QVERIFY(pathDb.open());
+            QSqlQuery tamper(pathDb);
+            tamper.prepare(QStringLiteral("UPDATE uploaded_assets SET filename=? WHERE id=?"));
+            tamper.addBindValue(QStringLiteral("..\\outside.png"));
+            tamper.addBindValue(cover.id);
+            QVERIFY(tamper.exec());
+            pathDb.close();
+        }
+        QSqlDatabase::removeDatabase(pathConnection);
+        QVERIFY(repository.loadAssetImage(cover.reference, &error).isNull());
+        QVERIFY(error.contains(QStringLiteral("stored image name"), Qt::CaseInsensitive));
+        const QString restorePathConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase pathDb = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), restorePathConnection);
+            pathDb.setDatabaseName(databasePath);
+            QVERIFY(pathDb.open());
+            QSqlQuery restore(pathDb);
+            restore.prepare(QStringLiteral("UPDATE uploaded_assets SET filename=? WHERE id=?"));
+            restore.addBindValue(cover.id + QStringLiteral(".png"));
+            restore.addBindValue(cover.id);
+            QVERIFY(restore.exec());
+            pathDb.close();
+        }
+        QSqlDatabase::removeDatabase(restorePathConnection);
+        QVERIFY(!repository.loadAssetImage(cover.reference, &error).isNull());
+
+        const QString otherConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QString foreignAssetId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase other = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), otherConnection);
+            other.setDatabaseName(databasePath);
+            QVERIFY2(other.open(), qPrintable(other.lastError().text()));
+            QSqlQuery insertUser(other);
+            QVERIFY(insertUser.exec(QStringLiteral("INSERT INTO users(id,username,password_hash,created_at) VALUES('other-user','Other','hash','now')")));
+            QSqlQuery insertAsset(other);
+            insertAsset.prepare(QStringLiteral("INSERT INTO uploaded_assets(id,user_id,game_id,filename,mime_type,size_bytes,created_at) VALUES(?, 'other-user', NULL, 'foreign.png', 'image/png', 1, 'now')"));
+            insertAsset.addBindValue(foreignAssetId);
+            QVERIFY2(insertAsset.exec(), qPrintable(insertAsset.lastError().text()));
+            other.close();
+        }
+        QSqlDatabase::removeDatabase(otherConnection);
+        QVERIFY(repository.loadAssetImage(QStringLiteral("/api/assets/") + foreignAssetId, &error).isNull());
+        QVERIFY(!repository.deleteAsset(foreignAssetId, nullptr, &error));
+        QCOMPARE(repository.uploadedAssets(&error).size(), 3);
+
+        QString gameId;
+        QVERIFY2(repository.createGame(QStringLiteral("Cover game"), QStringLiteral("Description"), QStringLiteral("🎮"),
+                                       &gameId, &error, QStringLiteral("Private notes"), cover.reference), qPrintable(error));
+        auto games = repository.games(&error);
+        QCOMPARE(games.size(), 1);
+        QCOMPARE(games.first().personalNotes, QStringLiteral("Private notes"));
+        QCOMPARE(games.first().coverImage, cover.reference);
+        Game changed = games.first();
+        changed.personalNotes = QStringLiteral("Updated notes");
+        QVERIFY2(repository.updateGame(changed, &error), qPrintable(error));
+        games = repository.games(&error);
+        QCOMPARE(games.first().personalNotes, QStringLiteral("Updated notes"));
+        QCOMPARE(games.first().coverImage, cover.reference);
+
+        QString typeId;
+        QVERIFY2(repository.createObjectType(gameId, QStringLiteral("Type"), {}, {}, &typeId, &error, converted.reference), qPrintable(error));
+        QCOMPARE(repository.objectTypes(gameId, &error).first().image, converted.reference);
+        ObjectRecord object;
+        object.gameId = gameId;
+        object.typeId = typeId;
+        object.name = QStringLiteral("Archived image owner");
+        object.image = cover.reference;
+        QVERIFY2(repository.saveObject(object, {}, {}, &error), qPrintable(error));
+        QVERIFY2(repository.archiveObject(object.id, &error), qPrintable(error));
+        QVERIFY(!repository.deleteAsset(cover.id, nullptr, &error));
+        QVERIFY(error.contains(QStringLiteral("archived"), Qt::CaseInsensitive));
+        QVERIFY(!repository.deleteAsset(converted.id, nullptr, &error));
+
+        QVERIFY(!repository.createGame(QStringLiteral("Bad owner reference"), {}, {}, nullptr, &error,
+                                       {}, QStringLiteral("/api/assets/") + foreignAssetId));
+        QCOMPARE(repository.games(&error).size(), 1);
+
+        UploadedAsset cleanup;
+        QVERIFY2(repository.uploadAsset(png, &cleanup, &error), qPrintable(error));
+        const QString cleanupDirectory = directory.filePath(QStringLiteral("uploads/") + cleanup.id + QStringLiteral(".png"));
+        QVERIFY(QFile::remove(cleanupDirectory));
+        QVERIFY(QDir().mkdir(cleanupDirectory));
+        bool pending = false;
+        QVERIFY(repository.deleteAsset(cleanup.id, &pending, &error));
+        QVERIFY(pending);
+        QVERIFY(!error.isEmpty());
+        const auto queuedAssets = repository.uploadedAssets(&error);
+        bool foundPending = false;
+        for (const UploadedAsset &asset : queuedAssets) foundPending = foundPending || (asset.id == cleanup.id && asset.pendingDeletion);
+        QVERIFY(foundPending);
+        QVERIFY(QDir().rmdir(cleanupDirectory));
+        QVERIFY2(repository.retryAssetCleanup(&error), qPrintable(error));
+        for (const UploadedAsset &asset : repository.uploadedAssets(&error)) QVERIFY(asset.id != cleanup.id);
+
+        const QString quotaPath = directory.filePath(QStringLiteral("quota.sqlite"));
+        GameRepository quotaRepository(quotaPath);
+        QVERIFY2(quotaRepository.open(&error), qPrintable(error));
+        const QString quotaConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase quotaDb = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), quotaConnection);
+            quotaDb.setDatabaseName(quotaPath);
+            QVERIFY2(quotaDb.open(), qPrintable(quotaDb.lastError().text()));
+            QVERIFY(quotaDb.transaction());
+            QSqlQuery insert(quotaDb);
+            insert.prepare(QStringLiteral("INSERT INTO uploaded_assets(id,user_id,game_id,filename,mime_type,size_bytes,created_at) VALUES(?, 'native-desktop-local', NULL, 'quota.png', 'image/png', 1, 'now')"));
+            for (int index = 0; index < 1000; ++index) {
+                insert.bindValue(0, QStringLiteral("quota-%1").arg(index));
+                QVERIFY2(insert.exec(), qPrintable(insert.lastError().text()));
+            }
+            QVERIFY(quotaDb.commit());
+            quotaDb.close();
+        }
+        QSqlDatabase::removeDatabase(quotaConnection);
+        QVERIFY(!quotaRepository.uploadAsset(png, nullptr, &error));
+        QVERIFY(error.contains(QStringLiteral("1000")));
+        QCOMPARE(quotaRepository.uploadedAssets(&error).size(), 1000);
+
+        const QString byteQuotaPath = directory.filePath(QStringLiteral("byte-quota.sqlite"));
+        GameRepository byteQuotaRepository(byteQuotaPath);
+        QVERIFY2(byteQuotaRepository.open(&error), qPrintable(error));
+        const QString byteQuotaConnection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase byteDb = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), byteQuotaConnection);
+            byteDb.setDatabaseName(byteQuotaPath);
+            QVERIFY(byteDb.open());
+            QSqlQuery insert(byteDb);
+            insert.prepare(QStringLiteral("INSERT INTO uploaded_assets(id,user_id,game_id,filename,mime_type,size_bytes,created_at) VALUES('full','native-desktop-local',NULL,'full.png','image/png',?, 'now')"));
+            insert.addBindValue(250LL * 1024 * 1024);
+            QVERIFY(insert.exec());
+            byteDb.close();
+        }
+        QSqlDatabase::removeDatabase(byteQuotaConnection);
+        QVERIFY(!byteQuotaRepository.uploadAsset(png, nullptr, &error));
+        QVERIFY(error.contains(QStringLiteral("250 MB")));
     }
 };
 

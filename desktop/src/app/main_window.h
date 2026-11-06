@@ -45,6 +45,7 @@ private:
     void openObjectEditor(const QString &objectId = {});
     void openGoalEditor(const QString &goalId = {});
     void openProfile();
+    QString openAssetLibrary(QWidget *parent, const QString &currentReference = {}, bool selectionMode = true);
     Game currentGame() const;
 
     GameRepository &m_repository;
