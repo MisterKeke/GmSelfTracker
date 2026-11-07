@@ -1,6 +1,7 @@
 #include "app/main_window.h"
 
 #include "app/theme.h"
+#include "app/web_import_dialog.h"
 #include "infrastructure/database/game_repository.h"
 #include "domain/formula_evaluator.h"
 #include "infrastructure/assets/image_decoder.h"
@@ -24,6 +25,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIntValidator>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QIcon>
@@ -49,6 +51,7 @@
 #include <QValidator>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+#include <cmath>
 
 namespace gmst {
 namespace {
@@ -74,6 +77,20 @@ QPushButton *button(const QString &text, const QString &objectName = {}, QWidget
     auto *result = new QPushButton(text, parent);
     if (!objectName.isEmpty()) result->setObjectName(objectName);
     return result;
+}
+
+QVector<FieldDefinition> prioritizedCardFields(const ObjectType &type)
+{
+    QVector<FieldDefinition> fields;
+    if (!type.primaryDisplayFieldId.isEmpty()) {
+        const auto primary = std::find_if(type.fields.cbegin(), type.fields.cend(), [&](const FieldDefinition &field) {
+            return field.id == type.primaryDisplayFieldId && !field.archived;
+        });
+        if (primary != type.fields.cend()) fields.append(*primary);
+    }
+    for (const FieldDefinition &field : type.fields)
+        if (!field.archived && field.id != type.primaryDisplayFieldId) fields.append(field);
+    return fields;
 }
 
 void addDialogButtons(QVBoxLayout *layout, QDialog *dialog, QPushButton **saveButton = nullptr)
@@ -149,7 +166,7 @@ void MainWindow::buildUi()
     auto *profileMetaLayout = new QVBoxLayout(profileMeta);
     profileMetaLayout->setContentsMargins(0, 0, 0, 0);
     profileMetaLayout->setSpacing(0);
-    profileMetaLayout->addWidget(textLabel(QStringLiteral("Local Player")));
+    profileMetaLayout->addWidget(textLabel(m_repository.activeUsername(), QStringLiteral("activeAccountName")));
     profileMetaLayout->addWidget(textLabel(QStringLiteral("▣ My Profile"), QStringLiteral("mutedText")));
     auto *profileButton = button(QString(), QStringLiteral("iconButton"));
     profileButton->setObjectName(QStringLiteral("profileButton"));
@@ -382,7 +399,7 @@ QWidget *MainWindow::makeGameWorkspace()
         QStringLiteral("EVERY QUEST STARTS SOMEWHERE"), QStringLiteral("Create a manual goal, checklist, numeric target, or goal linked to a numeric object field.")));
     m_pages->addWidget(makePage(QStringLiteral("YOUR CUSTOM DATA TYPES"),
         QStringLiteral("Fields belong to a type and stay editable on each object."), QStringLiteral("⚙"),
-        QStringLiteral("DEFINE YOUR COLLECTION"), QStringLiteral("Create object types and basic fields. Formula and field migration tools are not implemented yet.")));
+        QStringLiteral("DEFINE YOUR COLLECTION"), QStringLiteral("Edit reusable object types and fields, preview formulas, and safely migrate saved values.")));
     m_pages->addWidget(makePage(QStringLiteral("GAME TEMPLATES"),
         QStringLiteral("Import and export game structures from reusable templates."), QStringLiteral("▣"),
         QStringLiteral("NO GAME TEMPLATES YET"), QStringLiteral("Template export, import, and instantiation have not been ported yet.")));
@@ -714,8 +731,8 @@ void MainWindow::refreshFeaturePages()
             detailsLayout->addWidget(type);
             int shownFields = 0;
             if (typeIt != m_types.cend()) {
-                for (const FieldDefinition &field : typeIt->fields) {
-                    if (field.archived || shownFields >= 4) continue;
+                for (const FieldDefinition &field : prioritizedCardFields(*typeIt)) {
+                    if (shownFields >= 4) continue;
                     QString valueText;
                     if (field.fieldType == QStringLiteral("reference") || field.fieldType == QStringLiteral("references")) {
                         QStringList labels;
@@ -814,7 +831,8 @@ void MainWindow::refreshFeaturePages()
 
     refreshObjectPage();
 
-    if (!m_types.isEmpty()) {
+    const QVector<ObjectType> managedTypes = m_repository.objectTypes(m_selectedGameId, nullptr, true);
+    if (!managedTypes.isEmpty()) {
         auto *scroll = new QScrollArea(m_pages->widget(3));
         scroll->setWidgetResizable(true);
         scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -824,13 +842,14 @@ void MainWindow::refreshFeaturePages()
         grid->setContentsMargins(1, 1, 8, 8);
         grid->setSpacing(10);
         int index = 0;
-        for (const ObjectType &type : std::as_const(m_types)) {
+        for (const ObjectType &type : std::as_const(managedTypes)) {
             auto *card = panel(QStringLiteral("typeCard"), content);
             card->setStyleSheet(QStringLiteral("QFrame#typeCard { background:#fff2d6;border:3px solid #c5a76f; }"));
             auto *cardLayout = new QVBoxLayout(card);
             cardLayout->setContentsMargins(10, 9, 10, 9);
             cardLayout->setSpacing(5);
-            auto *title = textLabel(QStringLiteral("◈  %1").arg(type.name));
+            auto *title = textLabel(QStringLiteral("%1  %2%3").arg(type.icon, type.name,
+                type.archived ? QStringLiteral("  ·  ARCHIVED") : QString()));
             title->setStyleSheet(QStringLiteral("color:#372746;font-size:15px;font-weight:900;"));
             cardLayout->addWidget(title);
             if (!type.description.isEmpty()) {
@@ -838,24 +857,101 @@ void MainWindow::refreshFeaturePages()
                 description->setStyleSheet(QStringLiteral("color:#705b70;font-size:11px;"));
                 cardLayout->addWidget(description);
             }
+            if (!type.archived) {
+                auto *primaryRow = new QWidget(card);
+                auto *primaryLayout = new QHBoxLayout(primaryRow);
+                primaryLayout->setContentsMargins(0, 2, 0, 2);
+                primaryLayout->addWidget(textLabel(QStringLiteral("Primary display")));
+                auto *primaryChoice = new QComboBox(primaryRow);
+                primaryChoice->setObjectName(QStringLiteral("primaryDisplayFieldChoice"));
+                primaryChoice->addItem(QStringLiteral("None"), QString());
+                for (const FieldDefinition &field : type.fields)
+                    if (!field.archived) primaryChoice->addItem(field.icon + QStringLiteral("  ") + field.name, field.id);
+                const int primaryIndex = primaryChoice->findData(type.primaryDisplayFieldId);
+                primaryChoice->setCurrentIndex(std::max(0, primaryIndex));
+                primaryLayout->addWidget(primaryChoice, 1);
+                auto *savePrimary = button(QStringLiteral("Save"), QStringLiteral("softButton"), primaryRow);
+                primaryLayout->addWidget(savePrimary);
+                connect(savePrimary, &QPushButton::clicked, this, [this, id = type.id, primaryChoice] {
+                    QString error;
+                    if (!m_repository.setPrimaryDisplayField(id, primaryChoice->currentData().toString(), &error))
+                        QMessageBox::warning(this, QStringLiteral("Could not update primary field"), error);
+                    else refreshGames(m_selectedGameId);
+                });
+                cardLayout->addWidget(primaryRow);
+            }
             for (const FieldDefinition &field : type.fields) {
-                if (field.archived) continue;
                 auto *fieldRow = new QWidget(card);
+                fieldRow->setObjectName(QStringLiteral("typeFieldRow"));
                 auto *rowLayout = new QHBoxLayout(fieldRow);
                 rowLayout->setContentsMargins(0, 2, 0, 2);
-                rowLayout->addWidget(textLabel(QStringLiteral("✦  ") + field.name));
-                rowLayout->addStretch(1);
+                auto *fieldTitle = textLabel(QStringLiteral("%1  %2%3").arg(field.icon, field.name,
+                    field.archived ? QStringLiteral("  ·  ARCHIVED") : QString()));
+                fieldTitle->setObjectName(QStringLiteral("typeFieldRowTitle"));
+                fieldTitle->setProperty("fieldId", field.id);
+                rowLayout->addWidget(fieldTitle, 1);
                 auto *kind = textLabel(field.fieldType.toUpper());
                 kind->setStyleSheet(QStringLiteral("color:#735d75;font-size:9px;"));
                 rowLayout->addWidget(kind);
+                auto *editField = button(QStringLiteral("Edit"), QStringLiteral("softButton"), fieldRow);
+                editField->setObjectName(QStringLiteral("editFieldButton"));
+                editField->setEnabled(!field.archived && !type.archived);
+                rowLayout->addWidget(editField);
+                connect(editField, &QPushButton::clicked, this, [this, typeId = type.id, fieldId = field.id] {
+                    openEditField(typeId, fieldId);
+                });
+                auto *migrateField = button(QStringLiteral("Change Type…"), QStringLiteral("softButton"), fieldRow);
+                migrateField->setObjectName(QStringLiteral("migrateFieldTypeButton"));
+                migrateField->setEnabled(!field.archived && !type.archived);
+                rowLayout->addWidget(migrateField);
+                connect(migrateField, &QPushButton::clicked, this, [this, typeId = type.id, fieldId = field.id] {
+                    openFieldTypeMigration(typeId, fieldId);
+                });
+                auto *archiveField = button(field.archived ? QStringLiteral("Restore") : QStringLiteral("Archive"),
+                    QStringLiteral("softButton"), fieldRow);
+                archiveField->setEnabled(!type.archived);
+                rowLayout->addWidget(archiveField);
+                connect(archiveField, &QPushButton::clicked, this, [this, field] {
+                    const bool archive = !field.archived;
+                    if (archive && QMessageBox::question(this, QStringLiteral("Archive field"),
+                        QStringLiteral("Archive %1? Its saved values will be preserved. Any active dependency must be updated first.").arg(field.name)) != QMessageBox::Yes) return;
+                    QString error;
+                    if (!m_repository.setFieldArchived(field.id, archive, &error))
+                        QMessageBox::warning(this, archive ? QStringLiteral("Could not archive field") : QStringLiteral("Could not restore field"), error);
+                    else refreshGames(m_selectedGameId);
+                });
                 cardLayout->addWidget(fieldRow);
             }
             auto *actions = new QHBoxLayout();
-            auto *addField = button(QStringLiteral("＋ Add Field"), QStringLiteral("softButton"), card);
-            actions->addWidget(addField);
+            if (!type.archived) {
+                auto *editType = button(QStringLiteral("Edit Type"), QStringLiteral("softButton"), card);
+                actions->addWidget(editType);
+                connect(editType, &QPushButton::clicked, this, [this, id = type.id] { openEditType(id); });
+                auto *archiveType = button(QStringLiteral("Archive Type"), QStringLiteral("softButton"), card);
+                actions->addWidget(archiveType);
+                connect(archiveType, &QPushButton::clicked, this, [this, type] {
+                    if (QMessageBox::question(this, QStringLiteral("Archive object type"),
+                        QStringLiteral("Archive %1? Its objects, values, and relationships will be kept.").arg(type.name)) != QMessageBox::Yes) return;
+                    QString error;
+                    if (!m_repository.setObjectTypeArchived(type.id, true, &error))
+                        QMessageBox::warning(this, QStringLiteral("Could not archive type"), error);
+                    else refreshGames(m_selectedGameId);
+                });
+                auto *addField = button(QStringLiteral("＋ Add Field"), QStringLiteral("softButton"), card);
+                actions->addWidget(addField);
+                connect(addField, &QPushButton::clicked, this, [this, id = type.id] { openCreateField(id); });
+            } else {
+                auto *restoreType = button(QStringLiteral("Restore Type"), QStringLiteral("softButton"), card);
+                actions->addWidget(restoreType);
+                connect(restoreType, &QPushButton::clicked, this, [this, type] {
+                    QString error;
+                    if (!m_repository.setObjectTypeArchived(type.id, false, &error))
+                        QMessageBox::warning(this, QStringLiteral("Could not restore type"), error);
+                    else refreshGames(m_selectedGameId);
+                });
+            }
             actions->addStretch(1);
             cardLayout->addLayout(actions);
-            connect(addField, &QPushButton::clicked, this, [this, id = type.id] { openCreateField(id); });
             grid->addWidget(card, index / 2, index % 2);
             ++index;
         }
@@ -1173,8 +1269,7 @@ void MainWindow::refreshObjectPage()
             values->setVerticalSpacing(1);
             int row = 0;
             if (typeIt != m_types.cend()) {
-                for (const FieldDefinition &field : typeIt->fields) {
-                    if (field.archived) continue;
+                for (const FieldDefinition &field : prioritizedCardFields(*typeIt)) {
                     QString valueText;
                     if (field.fieldType == QStringLiteral("reference") || field.fieldType == QStringLiteral("references")) {
                         QStringList labels;
@@ -1536,6 +1631,66 @@ void MainWindow::openCreateType()
     }
 }
 
+void MainWindow::openEditType(const QString &typeId)
+{
+    const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == typeId; });
+    if (typeIt == m_types.cend()) return;
+    const ObjectType original = *typeIt;
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Edit Object Type · %1").arg(original.name));
+    dialog.setMinimumWidth(470);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    auto *name = new QLineEdit(original.name, &dialog);
+    name->setObjectName(QStringLiteral("typeNameInput"));
+    name->setMaxLength(80);
+    auto *description = new QLineEdit(original.description, &dialog);
+    description->setObjectName(QStringLiteral("typeDescriptionInput"));
+    auto *icon = new QLineEdit(original.icon, &dialog);
+    icon->setObjectName(QStringLiteral("typeIconInput"));
+    icon->setMaxLength(64);
+    auto *image = new QLineEdit(original.image, &dialog);
+    image->setReadOnly(true);
+    auto *imageRow = new QWidget(&dialog);
+    auto *imageLayout = new QHBoxLayout(imageRow);
+    imageLayout->setContentsMargins(0, 0, 0, 0);
+    imageLayout->addWidget(image, 1);
+    auto *chooseImage = button(QStringLiteral("Choose…"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(chooseImage);
+    auto *clearImage = button(QStringLiteral("Clear"), QStringLiteral("softButton"), imageRow);
+    imageLayout->addWidget(clearImage);
+    connect(clearImage, &QPushButton::clicked, &dialog, [image] { image->clear(); });
+    connect(chooseImage, &QPushButton::clicked, &dialog, [this, &dialog, image] {
+        const QString reference = openAssetLibrary(&dialog, image->text());
+        if (!reference.isNull()) image->setText(reference);
+    });
+    form->addRow(QStringLiteral("Type name"), name);
+    form->addRow(QStringLiteral("Description"), description);
+    form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Fallback image"), imageRow);
+    layout->addLayout(form);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    auto *save = buttons->addButton(QStringLiteral("Save Type"), QDialogButtonBox::AcceptRole);
+    save->setObjectName(QStringLiteral("goldButton"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, original, name, description, icon, image] {
+        ObjectType edited = original;
+        edited.name = name->text();
+        edited.description = description->text();
+        edited.icon = icon->text();
+        edited.image = image->text();
+        QString error;
+        if (!m_repository.updateObjectType(edited, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not update type"), error);
+            return;
+        }
+        dialog.accept();
+    });
+    name->setFocus();
+    if (dialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
+}
+
 void MainWindow::openCreateField(const QString &typeId)
 {
     const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == typeId; });
@@ -1888,6 +2043,584 @@ void MainWindow::openCreateField(const QString &typeId)
     refreshAggregationFields();
     updateFormulaPreview();
     name->setFocus();
+    if (dialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
+}
+
+void MainWindow::openEditField(const QString &typeId, const QString &fieldId)
+{
+    const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == typeId; });
+    if (typeIt == m_types.cend()) return;
+    const auto fieldIt = std::find_if(typeIt->fields.cbegin(), typeIt->fields.cend(), [&](const FieldDefinition &field) { return field.id == fieldId; });
+    if (fieldIt == typeIt->fields.cend() || fieldIt->archived) return;
+    const ObjectType originalType = *typeIt;
+    const FieldDefinition original = *fieldIt;
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Edit Field · %1").arg(original.name));
+    dialog.setMinimumWidth(560);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    auto *name = new QLineEdit(original.name, &dialog);
+    name->setObjectName(QStringLiteral("fieldEditNameInput"));
+    name->setMaxLength(80);
+    auto *icon = new QLineEdit(original.icon, &dialog);
+    icon->setObjectName(QStringLiteral("fieldEditIconInput"));
+    icon->setMaxLength(64);
+    auto *description = new QLineEdit(original.description, &dialog);
+    description->setObjectName(QStringLiteral("fieldEditDescriptionInput"));
+    auto *sortOrder = new QSpinBox(&dialog);
+    sortOrder->setObjectName(QStringLiteral("fieldEditSortOrder"));
+    sortOrder->setRange(0, 1000000);
+    sortOrder->setValue(std::max(0, original.sortOrder));
+    form->addRow(QStringLiteral("Field name"), name);
+    form->addRow(QStringLiteral("Icon"), icon);
+    form->addRow(QStringLiteral("Description"), description);
+    form->addRow(QStringLiteral("Order"), sortOrder);
+
+    auto *defaultValue = new QLineEdit(&dialog);
+    defaultValue->setObjectName(QStringLiteral("fieldEditDefaultValue"));
+    if (original.defaultValue.isString()) defaultValue->setText(original.defaultValue.toString());
+    else if (!original.defaultValue.isUndefined() && !original.defaultValue.isNull()) {
+        if (original.defaultValue.isObject()) defaultValue->setText(QString::fromUtf8(QJsonDocument(original.defaultValue.toObject()).toJson(QJsonDocument::Compact)));
+        else if (original.defaultValue.isArray()) defaultValue->setText(QString::fromUtf8(QJsonDocument(original.defaultValue.toArray()).toJson(QJsonDocument::Compact)));
+        else defaultValue->setText(QString::fromUtf8(QJsonDocument(QJsonArray{original.defaultValue}).toJson(QJsonDocument::Compact)).mid(1).chopped(1));
+    }
+    defaultValue->setPlaceholderText(QStringLiteral("Leave empty to remove the default"));
+    const bool supportsDefault = original.fieldType != QStringLiteral("formula") && original.fieldType != QStringLiteral("reference") &&
+        original.fieldType != QStringLiteral("references");
+    defaultValue->setVisible(supportsDefault);
+    if (supportsDefault) form->addRow(QStringLiteral("Default value"), defaultValue);
+
+    auto *choices = new QTextEdit(&dialog);
+    choices->setObjectName(QStringLiteral("fieldEditChoices"));
+    choices->setMaximumHeight(110);
+    const QJsonArray previousChoices = original.options.value(QStringLiteral("choices")).toArray();
+    QStringList previousChoiceList;
+    for (const QJsonValue &choice : previousChoices) previousChoiceList.append(choice.toString());
+    choices->setPlainText(previousChoiceList.join(QLatin1Char('\n')));
+    choices->setVisible(original.fieldType == QStringLiteral("select"));
+    if (original.fieldType == QStringLiteral("select")) form->addRow(QStringLiteral("Choices (one per line)"), choices);
+
+    auto *targetType = new QComboBox(&dialog);
+    targetType->setObjectName(QStringLiteral("fieldEditTargetType"));
+    targetType->addItem(QStringLiteral("Any type in this game"), QString());
+    for (const ObjectType &target : std::as_const(m_types)) targetType->addItem(target.name, target.id);
+    const int previousTarget = targetType->findData(original.options.value(QStringLiteral("allowed_type_id")).toString());
+    if (previousTarget >= 0) targetType->setCurrentIndex(previousTarget);
+    const bool hasReferenceOptions = original.fieldType == QStringLiteral("reference") || original.fieldType == QStringLiteral("references");
+    targetType->setVisible(hasReferenceOptions);
+    if (hasReferenceOptions) form->addRow(QStringLiteral("Allowed reference type"), targetType);
+
+    auto *formulaExpression = new QTextEdit(&dialog);
+    formulaExpression->setObjectName(QStringLiteral("fieldEditFormulaExpression"));
+    formulaExpression->setMaximumHeight(90);
+    formulaExpression->setPlaceholderText(QStringLiteral("(@{field-id} + 2) * 3"));
+    formulaExpression->setPlainText(original.options.value(QStringLiteral("expression")).toString());
+    const bool formulaField = original.fieldType == QStringLiteral("formula");
+    formulaExpression->setVisible(formulaField);
+    if (formulaField) form->addRow(QStringLiteral("Formula expression"), formulaExpression);
+    auto *insertReference = new QComboBox(&dialog);
+    insertReference->addItem(QStringLiteral("Insert numeric field…"), QString());
+    for (const FieldDefinition &candidate : originalType.fields) {
+        if (candidate.archived || candidate.id == original.id) continue;
+        if (candidate.fieldType == QStringLiteral("integer") || candidate.fieldType == QStringLiteral("decimal") ||
+            candidate.fieldType == QStringLiteral("percentage") || candidate.fieldType == QStringLiteral("progress") ||
+            candidate.fieldType == QStringLiteral("formula"))
+            insertReference->addItem(candidate.name, candidate.id);
+    }
+    insertReference->setVisible(formulaField);
+    if (formulaField) form->addRow(QStringLiteral("Insert reference"), insertReference);
+    connect(insertReference, &QComboBox::activated, &dialog, [insertReference, formulaExpression](int index) {
+        const QString fieldId = insertReference->itemData(index).toString();
+        if (fieldId.isEmpty()) return;
+        formulaExpression->insertPlainText(QStringLiteral("@{%1}").arg(fieldId));
+        insertReference->setCurrentIndex(0);
+    });
+
+    auto *aggregationRelation = new QComboBox(&dialog);
+    aggregationRelation->addItem(QStringLiteral("No relationship aggregation"), QString());
+    for (const FieldDefinition &candidate : originalType.fields) {
+        if (!candidate.archived && (candidate.fieldType == QStringLiteral("reference") || candidate.fieldType == QStringLiteral("references")))
+            aggregationRelation->addItem(candidate.name, candidate.id);
+    }
+    auto *aggregationOperation = new QComboBox(&dialog);
+    aggregationOperation->addItem(QStringLiteral("Sum"), QStringLiteral("sum"));
+    aggregationOperation->addItem(QStringLiteral("Average"), QStringLiteral("avg"));
+    aggregationOperation->addItem(QStringLiteral("Minimum"), QStringLiteral("min"));
+    aggregationOperation->addItem(QStringLiteral("Maximum"), QStringLiteral("max"));
+    aggregationOperation->addItem(QStringLiteral("Count"), QStringLiteral("count"));
+    auto *aggregationField = new QComboBox(&dialog);
+    const QJsonObject oldAggregation = original.options.value(QStringLiteral("aggregation")).toObject();
+    int relationIndex = aggregationRelation->findData(oldAggregation.value(QStringLiteral("relationship_field_id")).toString());
+    if (relationIndex >= 0) aggregationRelation->setCurrentIndex(relationIndex);
+    int operationIndex = aggregationOperation->findData(oldAggregation.value(QStringLiteral("operation")).toString());
+    if (operationIndex >= 0) aggregationOperation->setCurrentIndex(operationIndex);
+    aggregationRelation->setVisible(formulaField);
+    aggregationOperation->setVisible(formulaField);
+    aggregationField->setVisible(formulaField);
+    if (formulaField) {
+        form->addRow(QStringLiteral("Aggregate related objects"), aggregationRelation);
+        form->addRow(QStringLiteral("Aggregation"), aggregationOperation);
+        form->addRow(QStringLiteral("Numeric target field"), aggregationField);
+    }
+    auto refreshAggregationFields = [this, aggregationRelation, aggregationField, oldAggregation] {
+        const QString previousId = aggregationField->currentData().toString().isEmpty()
+            ? oldAggregation.value(QStringLiteral("field_id")).toString() : aggregationField->currentData().toString();
+        aggregationField->clear();
+        QString allowedType;
+        for (const ObjectType &type : std::as_const(m_types)) {
+            for (const FieldDefinition &field : type.fields) {
+                if (field.id == aggregationRelation->currentData().toString())
+                    allowedType = field.options.value(QStringLiteral("allowed_type_id")).toString();
+            }
+        }
+        for (const ObjectType &type : std::as_const(m_types)) {
+            if (!allowedType.isEmpty() && type.id != allowedType) continue;
+            for (const FieldDefinition &field : type.fields) {
+                if (!field.archived && (field.fieldType == QStringLiteral("integer") || field.fieldType == QStringLiteral("decimal") ||
+                    field.fieldType == QStringLiteral("percentage") || field.fieldType == QStringLiteral("progress") ||
+                    field.fieldType == QStringLiteral("formula")))
+                    aggregationField->addItem(type.name + QStringLiteral(" · ") + field.name, field.id);
+            }
+        }
+        const int selected = aggregationField->findData(previousId);
+        if (selected >= 0) aggregationField->setCurrentIndex(selected);
+    };
+    connect(aggregationRelation, &QComboBox::currentIndexChanged, &dialog, refreshAggregationFields);
+    refreshAggregationFields();
+    auto updateAggregationVisibility = [aggregationRelation, aggregationOperation, aggregationField] {
+        const bool active = !aggregationRelation->currentData().toString().isEmpty();
+        aggregationOperation->setVisible(active);
+        aggregationField->setVisible(active && aggregationOperation->currentData().toString() != QStringLiteral("count"));
+    };
+    connect(aggregationRelation, &QComboBox::currentIndexChanged, &dialog, updateAggregationVisibility);
+    connect(aggregationOperation, &QComboBox::currentIndexChanged, &dialog, updateAggregationVisibility);
+    updateAggregationVisibility();
+
+    auto *sampleObject = new QComboBox(&dialog);
+    sampleObject->addItem(QStringLiteral("Choose a sample object…"), QString());
+    for (const ObjectRecord &object : std::as_const(m_objects))
+        if (object.typeId == typeId) sampleObject->addItem(object.name, object.id);
+    auto *previewButton = button(QStringLiteral("Preview Formula"), QStringLiteral("softButton"), &dialog);
+    auto *previewResult = textLabel(QStringLiteral("Preview uses the selected active object."), {}, &dialog);
+    if (formulaField) {
+        form->addRow(QStringLiteral("Sample object"), sampleObject);
+        form->addRow(previewButton, previewResult);
+    }
+    previewButton->setVisible(formulaField);
+    previewResult->setVisible(formulaField);
+    connect(previewButton, &QPushButton::clicked, &dialog, [this, typeId, original, formulaExpression, aggregationRelation,
+        aggregationOperation, aggregationField, sampleObject, previewResult] {
+        const QString objectId = sampleObject->currentData().toString();
+        if (objectId.isEmpty()) {
+            previewResult->setText(QStringLiteral("Choose a sample object first."));
+            return;
+        }
+        QJsonObject options{{QStringLiteral("expression"), formulaExpression->toPlainText()}};
+        if (!aggregationRelation->currentData().toString().isEmpty()) {
+            QJsonObject aggregation{{QStringLiteral("relationship_field_id"), aggregationRelation->currentData().toString()},
+                                    {QStringLiteral("operation"), aggregationOperation->currentData().toString()}};
+            if (aggregationOperation->currentData().toString() != QStringLiteral("count"))
+                aggregation.insert(QStringLiteral("field_id"), aggregationField->currentData().toString());
+            options.insert(QStringLiteral("aggregation"), aggregation);
+        }
+        QVector<ObjectType> previewTypes = m_types;
+        auto previewType = std::find_if(previewTypes.begin(), previewTypes.end(), [&](const ObjectType &type) { return type.id == typeId; });
+        if (previewType == previewTypes.end()) return;
+        auto previewField = std::find_if(previewType->fields.begin(), previewType->fields.end(), [&](const FieldDefinition &field) { return field.id == original.id; });
+        if (previewField == previewType->fields.end()) return;
+        previewField->options = options;
+        QVector<ObjectRecord> previewObjects = m_objects;
+        auto object = std::find_if(previewObjects.begin(), previewObjects.end(), [&](const ObjectRecord &item) { return item.id == objectId; });
+        if (object == previewObjects.end()) return;
+        FormulaEvaluator::evaluate(previewType->fields, *object, previewTypes, previewObjects);
+        if (object->formulaErrors.contains(original.id)) previewResult->setText(QStringLiteral("Preview error: %1").arg(object->formulaErrors.value(original.id)));
+        else previewResult->setText(QStringLiteral("Result: %1").arg(object->values.value(original.id).toDouble(), 0, 'g', 12));
+    });
+
+    layout->addLayout(form);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    auto *save = buttons->addButton(QStringLiteral("Save Field"), QDialogButtonBox::AcceptRole);
+    save->setObjectName(QStringLiteral("goldButton"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(save, &QPushButton::clicked, &dialog, [this, &dialog, original, name, icon, description, sortOrder, defaultValue,
+        supportsDefault, choices, targetType, formulaExpression, aggregationRelation, aggregationOperation, aggregationField] {
+        if (name->text().trimmed().isEmpty()) {
+            QMessageBox::warning(&dialog, QStringLiteral("Field name required"), QStringLiteral("Enter a name for this field."));
+            name->setFocus();
+            return;
+        }
+        FieldDefinition edited = original;
+        edited.name = name->text();
+        edited.icon = icon->text();
+        edited.description = description->text();
+        edited.sortOrder = sortOrder->value();
+        QMap<QString, QString> replacements;
+        if (edited.fieldType == QStringLiteral("select")) {
+            QJsonArray choiceValues;
+            QStringList values;
+            QSet<QString> unique;
+            for (const QString &line : choices->toPlainText().split(QLatin1Char('\n'))) {
+                const QString choice = line.trimmed();
+                if (choice.isEmpty()) continue;
+                if (choice.size() > 100 || unique.contains(choice) || choiceValues.size() >= 200) {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid choices"), QStringLiteral("Choices must be unique, nonempty, at most 100 characters, with no more than 200 values."));
+                    return;
+                }
+                unique.insert(choice);
+                values.append(choice);
+                choiceValues.append(choice);
+            }
+            if (values.isEmpty()) {
+                QMessageBox::warning(&dialog, QStringLiteral("Choices required"), QStringLiteral("Keep at least one select choice."));
+                return;
+            }
+            edited.options.insert(QStringLiteral("choices"), choiceValues);
+            for (const QJsonValue &oldChoice : original.options.value(QStringLiteral("choices")).toArray()) {
+                const QString removed = oldChoice.toString();
+                if (unique.contains(removed)) continue;
+                bool okay = false;
+                const QString replacement = QInputDialog::getItem(&dialog, QStringLiteral("Replace select value"),
+                    QStringLiteral("Choose a replacement for the existing value “%1”. This includes archived objects and the field default.").arg(removed),
+                    values, 0, false, &okay);
+                if (!okay) return;
+                replacements.insert(removed, replacement);
+            }
+        }
+        if (edited.fieldType == QStringLiteral("reference") || edited.fieldType == QStringLiteral("references")) {
+            const QString allowed = targetType->currentData().toString();
+            if (allowed.isEmpty()) edited.options.remove(QStringLiteral("allowed_type_id"));
+            else edited.options.insert(QStringLiteral("allowed_type_id"), allowed);
+        }
+        if (edited.fieldType == QStringLiteral("formula")) {
+            QJsonObject options{{QStringLiteral("expression"), formulaExpression->toPlainText()}};
+            if (!aggregationRelation->currentData().toString().isEmpty()) {
+                QJsonObject aggregation{{QStringLiteral("relationship_field_id"), aggregationRelation->currentData().toString()},
+                                        {QStringLiteral("operation"), aggregationOperation->currentData().toString()}};
+                if (aggregationOperation->currentData().toString() != QStringLiteral("count"))
+                    aggregation.insert(QStringLiteral("field_id"), aggregationField->currentData().toString());
+                options.insert(QStringLiteral("aggregation"), aggregation);
+            }
+            edited.options = options;
+        }
+        if (supportsDefault) {
+            const QString raw = defaultValue->text().trimmed();
+            if (raw.isEmpty()) edited.defaultValue = QJsonValue();
+            else if (edited.fieldType == QStringLiteral("text") || edited.fieldType == QStringLiteral("long_text") ||
+                     edited.fieldType == QStringLiteral("select") || edited.fieldType == QStringLiteral("date")) edited.defaultValue = raw;
+            else if (edited.fieldType == QStringLiteral("boolean")) {
+                if (raw.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0) edited.defaultValue = true;
+                else if (raw.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0) edited.defaultValue = false;
+                else {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid default"), QStringLiteral("Enter true or false for a checkbox default."));
+                    return;
+                }
+            } else if (edited.fieldType == QStringLiteral("progress")) {
+                QJsonParseError parseError;
+                const QJsonDocument parsed = QJsonDocument::fromJson(raw.toUtf8(), &parseError);
+                if (parseError.error != QJsonParseError::NoError || !parsed.isObject()) {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid default"), QStringLiteral("Enter progress as JSON, for example {\"current\":0,\"max\":10}."));
+                    return;
+                }
+                edited.defaultValue = parsed.object();
+            } else {
+                bool okay = false;
+                const double number = raw.toDouble(&okay);
+                if (!okay || !std::isfinite(number)) {
+                    QMessageBox::warning(&dialog, QStringLiteral("Invalid default"), QStringLiteral("Enter a finite number."));
+                    return;
+                }
+                edited.defaultValue = number;
+            }
+        }
+        QString error;
+        if (!m_repository.updateField(edited, replacements, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Could not update field"), error);
+            return;
+        }
+        dialog.accept();
+    });
+    name->setFocus();
+    if (dialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
+}
+
+void MainWindow::openFieldTypeMigration(const QString &typeId, const QString &fieldId)
+{
+    const auto typeIt = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &type) { return type.id == typeId; });
+    if (typeIt == m_types.cend() || typeIt->archived) return;
+    const auto fieldIt = std::find_if(typeIt->fields.cbegin(), typeIt->fields.cend(), [&](const FieldDefinition &field) { return field.id == fieldId; });
+    if (fieldIt == typeIt->fields.cend() || fieldIt->archived) return;
+    const ObjectType type = *typeIt;
+    const FieldDefinition field = *fieldIt;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("fieldTypeMigrationDialog"));
+    dialog.setWindowTitle(QStringLiteral("Change Field Type · %1").arg(field.name));
+    dialog.resize(760, 700);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *intro = textLabel(QStringLiteral("Preview active and archived object values, defaults, and dependencies before applying this atomic migration."));
+    layout->addWidget(intro);
+    auto *form = new QFormLayout();
+    auto *target = new QComboBox(&dialog);
+    target->setObjectName(QStringLiteral("migrationTargetType"));
+    const QStringList fieldTypes{QStringLiteral("text"), QStringLiteral("long_text"), QStringLiteral("integer"),
+        QStringLiteral("decimal"), QStringLiteral("percentage"), QStringLiteral("boolean"), QStringLiteral("select"),
+        QStringLiteral("date"), QStringLiteral("progress"), QStringLiteral("reference"), QStringLiteral("references"), QStringLiteral("formula")};
+    for (const QString &item : fieldTypes) target->addItem(item, item);
+    const int firstTarget = target->findData(field.fieldType == QStringLiteral("formula") ? QStringLiteral("decimal") : QStringLiteral("text"));
+    target->setCurrentIndex(firstTarget == target->findData(field.fieldType) ? (firstTarget + 1) % target->count() : firstTarget);
+    form->addRow(QStringLiteral("Current field"), textLabel(QStringLiteral("%1 · %2").arg(field.name, field.fieldType)));
+    form->addRow(QStringLiteral("New type"), target);
+
+    auto *choices = new QTextEdit(&dialog);
+    choices->setObjectName(QStringLiteral("migrationTargetChoices"));
+    choices->setMaximumHeight(90);
+    QStringList priorChoices;
+    for (const QJsonValue &choice : field.options.value(QStringLiteral("choices")).toArray()) priorChoices.append(choice.toString());
+    choices->setPlainText(priorChoices.join(QLatin1Char('\n')));
+    form->addRow(QStringLiteral("Target choices (one per line)"), choices);
+
+    auto *allowedType = new QComboBox(&dialog);
+    allowedType->setObjectName(QStringLiteral("migrationAllowedType"));
+    allowedType->addItem(QStringLiteral("Any type in this game"), QString());
+    for (const ObjectType &candidate : std::as_const(m_types))
+        if (!candidate.archived) allowedType->addItem(candidate.name, candidate.id);
+    const int currentAllowed = allowedType->findData(field.options.value(QStringLiteral("allowed_type_id")).toString());
+    if (currentAllowed >= 0) allowedType->setCurrentIndex(currentAllowed);
+    form->addRow(QStringLiteral("Allowed reference type"), allowedType);
+
+    auto *maximum = new QDoubleSpinBox(&dialog);
+    maximum->setObjectName(QStringLiteral("migrationProgressMaximum"));
+    maximum->setDecimals(6);
+    maximum->setRange(0.000001, 1000000000000.0);
+    maximum->setValue(100.0);
+    form->addRow(QStringLiteral("Progress maximum"), maximum);
+    auto *progressValue = new QComboBox(&dialog);
+    progressValue->setObjectName(QStringLiteral("migrationProgressValue"));
+    progressValue->addItem(QStringLiteral("Choose a value strategy…"), QString());
+    progressValue->addItem(QStringLiteral("Current value"), QStringLiteral("current"));
+    progressValue->addItem(QStringLiteral("Maximum value"), QStringLiteral("maximum"));
+    progressValue->addItem(QStringLiteral("Current ÷ maximum × 100"), QStringLiteral("percentage"));
+    form->addRow(QStringLiteral("Progress conversion"), progressValue);
+    auto *serializeLinks = new QCheckBox(QStringLiteral("Store linked object IDs as JSON text"), &dialog);
+    serializeLinks->setObjectName(QStringLiteral("migrationSerializeLinks"));
+    form->addRow(QStringLiteral("Reference conversion"), serializeLinks);
+    auto *clamp = new QCheckBox(QStringLiteral("Clamp values outside 0–100 to the nearest boundary"), &dialog);
+    clamp->setObjectName(QStringLiteral("migrationClampPercentage"));
+    form->addRow(QStringLiteral("Percentage conversion"), clamp);
+    auto *freeze = new QCheckBox(QStringLiteral("Freeze each current formula result into a stored value"), &dialog);
+    freeze->setObjectName(QStringLiteral("migrationFreezeFormula"));
+    form->addRow(QStringLiteral("Formula conversion"), freeze);
+
+    auto *defaultAction = new QComboBox(&dialog);
+    defaultAction->setObjectName(QStringLiteral("migrationDefaultAction"));
+    defaultAction->addItem(QStringLiteral("Convert the current default automatically"), QStringLiteral("convert"));
+    defaultAction->addItem(QStringLiteral("Clear the default"), QStringLiteral("clear"));
+    defaultAction->addItem(QStringLiteral("Set a new target default"), QStringLiteral("set"));
+    form->addRow(QStringLiteral("Default value"), defaultAction);
+    auto *defaultInput = new QLineEdit(&dialog);
+    defaultInput->setObjectName(QStringLiteral("migrationDefaultValue"));
+    defaultInput->setPlaceholderText(QStringLiteral("Text, number, true/false, or progress JSON"));
+    form->addRow(QStringLiteral("New default"), defaultInput);
+    layout->addLayout(form);
+
+    auto setControlVisibility = [=] {
+        const QString to = target->currentData().toString();
+        const bool numeric = to == QStringLiteral("integer") || to == QStringLiteral("decimal") || to == QStringLiteral("percentage");
+        const bool fromNumeric = field.fieldType == QStringLiteral("integer") || field.fieldType == QStringLiteral("decimal") || field.fieldType == QStringLiteral("percentage");
+        choices->setVisible(to == QStringLiteral("select"));
+        form->labelForField(choices)->setVisible(to == QStringLiteral("select"));
+        allowedType->setVisible(to == QStringLiteral("reference") || to == QStringLiteral("references"));
+        form->labelForField(allowedType)->setVisible(allowedType->isVisible());
+        maximum->setVisible(to == QStringLiteral("progress") && fromNumeric);
+        form->labelForField(maximum)->setVisible(maximum->isVisible());
+        progressValue->setVisible(field.fieldType == QStringLiteral("progress") && numeric);
+        form->labelForField(progressValue)->setVisible(progressValue->isVisible());
+        serializeLinks->setVisible((field.fieldType == QStringLiteral("reference") || field.fieldType == QStringLiteral("references")) &&
+            (to == QStringLiteral("text") || to == QStringLiteral("long_text")));
+        form->labelForField(serializeLinks)->setVisible(serializeLinks->isVisible());
+        clamp->setVisible(to == QStringLiteral("percentage"));
+        form->labelForField(clamp)->setVisible(clamp->isVisible());
+        freeze->setVisible(field.fieldType == QStringLiteral("formula") && numeric);
+        form->labelForField(freeze)->setVisible(freeze->isVisible());
+        const bool supportsDefault = to != QStringLiteral("formula") && to != QStringLiteral("reference") && to != QStringLiteral("references");
+        defaultAction->setVisible(supportsDefault);
+        form->labelForField(defaultAction)->setVisible(supportsDefault);
+        defaultInput->setVisible(supportsDefault && defaultAction->currentData().toString() == QStringLiteral("set"));
+        form->labelForField(defaultInput)->setVisible(defaultInput->isVisible());
+    };
+    connect(target, &QComboBox::currentIndexChanged, &dialog, setControlVisibility);
+    connect(defaultAction, &QComboBox::currentIndexChanged, &dialog, setControlVisibility);
+    setControlVisibility();
+
+    auto *mappings = new QWidget(&dialog);
+    mappings->setObjectName(QStringLiteral("migrationValueMappings"));
+    auto *mappingLayout = new QVBoxLayout(mappings);
+    mappingLayout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(mappings);
+    auto *previewText = new QTextEdit(&dialog);
+    previewText->setObjectName(QStringLiteral("fieldMigrationPreviewText"));
+    previewText->setReadOnly(true);
+    previewText->setMinimumHeight(150);
+    previewText->setPlainText(QStringLiteral("Choose a target type and preview the conversion."));
+    layout->addWidget(previewText, 1);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    auto *previewButton = buttons->addButton(QStringLiteral("Preview Conversion"), QDialogButtonBox::ActionRole);
+    previewButton->setObjectName(QStringLiteral("previewFieldMigrationButton"));
+    auto *applyButton = buttons->addButton(QStringLiteral("Apply Migration"), QDialogButtonBox::AcceptRole);
+    applyButton->setObjectName(QStringLiteral("applyFieldMigrationButton"));
+    applyButton->setEnabled(false);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    QString previewToken;
+    auto requestForCurrentControls = [&]() {
+        FieldMigrationRequest request;
+        request.targetType = target->currentData().toString();
+        if (request.targetType == QStringLiteral("select")) {
+            QJsonArray targetChoices;
+            for (const QString &line : choices->toPlainText().split(QLatin1Char('\n'))) {
+                const QString choice = line.trimmed();
+                if (!choice.isEmpty()) targetChoices.append(choice);
+            }
+            request.targetOptions.insert(QStringLiteral("choices"), targetChoices);
+        } else if (request.targetType == QStringLiteral("reference") || request.targetType == QStringLiteral("references")) {
+            const QString allowed = allowedType->currentData().toString();
+            if (!allowed.isEmpty()) request.targetOptions.insert(QStringLiteral("allowed_type_id"), allowed);
+        }
+        if (maximum->isVisible()) request.policy.insert(QStringLiteral("maximum"), maximum->value());
+        if (progressValue->isVisible() && !progressValue->currentData().toString().isEmpty())
+            request.policy.insert(QStringLiteral("progress_value"), progressValue->currentData().toString());
+        if (serializeLinks->isVisible() && serializeLinks->isChecked()) request.policy.insert(QStringLiteral("relationship_strategy"), QStringLiteral("serialize_ids"));
+        if (clamp->isVisible() && clamp->isChecked()) request.policy.insert(QStringLiteral("percentage_strategy"), QStringLiteral("clamp"));
+        if (freeze->isVisible() && freeze->isChecked()) request.policy.insert(QStringLiteral("freeze_formula"), true);
+        QJsonObject replacements;
+        QJsonObject referenceMappings;
+        for (QComboBox *combo : mappings->findChildren<QComboBox *>()) {
+            const QString selected = combo->currentData().toString();
+            const QString source = combo->property("migrationSourceValue").toString();
+            if (selected.isEmpty() || source.isNull()) continue;
+            if (combo->objectName() == QStringLiteral("selectReplacementChoice")) replacements.insert(source, selected);
+            else if (combo->objectName() == QStringLiteral("referenceReplacementObject")) referenceMappings.insert(source, selected);
+        }
+        if (!replacements.isEmpty()) request.policy.insert(QStringLiteral("select_replacements"), replacements);
+        if (!referenceMappings.isEmpty()) request.policy.insert(QStringLiteral("reference_mapping"), referenceMappings);
+        const QString action = defaultAction->currentData().toString();
+        if (defaultAction->isVisible() && action != QStringLiteral("convert")) {
+            request.defaultOverrideProvided = true;
+            if (action == QStringLiteral("clear")) request.defaultOverride = QJsonValue(QJsonValue::Null);
+            else {
+                const QString text = defaultInput->text().trimmed();
+                const QString to = request.targetType;
+                if (to == QStringLiteral("text") || to == QStringLiteral("long_text") || to == QStringLiteral("select") || to == QStringLiteral("date")) request.defaultOverride = text;
+                else if (to == QStringLiteral("boolean")) request.defaultOverride = text.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0 ? QJsonValue(true)
+                    : text.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0 ? QJsonValue(false) : QJsonValue();
+                else if (to == QStringLiteral("progress")) {
+                    QJsonParseError parseError;
+                    const QJsonDocument document = QJsonDocument::fromJson(text.toUtf8(), &parseError);
+                    request.defaultOverride = parseError.error == QJsonParseError::NoError && document.isObject() ? QJsonValue(document.object()) : QJsonValue();
+                } else {
+                    bool validNumber = false;
+                    const double number = text.toDouble(&validNumber);
+                    request.defaultOverride = validNumber && std::isfinite(number) ? QJsonValue(number) : QJsonValue();
+                }
+            }
+        }
+        return request;
+    };
+    auto invalidatePreview = [&] {
+        previewToken.clear();
+        applyButton->setEnabled(false);
+        previewText->setPlainText(QStringLiteral("Settings changed. Preview the conversion again before applying."));
+    };
+    connect(target, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(choices, &QTextEdit::textChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(allowedType, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(maximum, &QDoubleSpinBox::valueChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(progressValue, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(serializeLinks, &QCheckBox::toggled, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(clamp, &QCheckBox::toggled, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(freeze, &QCheckBox::toggled, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(defaultAction, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+    connect(defaultInput, &QLineEdit::textChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+
+    connect(previewButton, &QPushButton::clicked, &dialog, [&, requestForCurrentControls] {
+        const FieldMigrationRequest request = requestForCurrentControls();
+        QString error;
+        const FieldMigrationPreview result = m_repository.previewFieldTypeMigration(fieldId, request, &error);
+        while (QLayoutItem *item = mappingLayout->takeAt(0)) {
+            if (item->widget()) item->widget()->deleteLater();
+            delete item;
+        }
+        if (!error.isEmpty()) {
+            previewToken.clear();
+            applyButton->setEnabled(false);
+            previewText->setPlainText(error);
+            return;
+        }
+        QStringList lines;
+        lines << QStringLiteral("%1 → %2").arg(result.previousType, result.targetType)
+              << QStringLiteral("Affected objects: %1 · Saved values: %2 · Compatible: %3 · Incompatible: %4 · Archived objects: %5")
+                    .arg(result.affectedObjects).arg(result.savedValues).arg(result.compatibleValues).arg(result.incompatibleValues).arg(result.archivedObjectsAffected)
+              << QStringLiteral("Preset overrides: %1").arg(result.presetOverrides)
+              << QStringLiteral("Default: %1 → %2").arg(field.defaultValue.isUndefined() || field.defaultValue.isNull() ? QStringLiteral("none")
+                    : QString::fromUtf8(QJsonDocument(QJsonArray{field.defaultValue}).toJson(QJsonDocument::Compact).mid(1).chopped(1)),
+                    result.convertedDefault.isUndefined() || result.convertedDefault.isNull() ? QStringLiteral("none")
+                    : QString::fromUtf8(QJsonDocument(QJsonArray{result.convertedDefault}).toJson(QJsonDocument::Compact).mid(1).chopped(1)));
+        if (!result.formulaWarning.isEmpty()) lines << QStringLiteral("Warning: %1").arg(result.formulaWarning);
+        if (result.dependencies.isEmpty()) lines << QStringLiteral("Dependencies: none");
+        else lines << QStringLiteral("Dependencies: %1").arg(result.dependencies.join(QStringLiteral(", ")));
+        for (const QString &blocker : result.blockers) lines << QStringLiteral("BLOCKED: %1").arg(blocker);
+        for (const FieldMigrationExample &example : result.examples) {
+            const QString raw = example.value.isUndefined() || example.value.isNull() ? QStringLiteral("null")
+                : QString::fromUtf8(QJsonDocument(QJsonArray{example.value}).toJson(QJsonDocument::Compact).mid(1).chopped(1));
+            lines << QStringLiteral("%1 (%2): %3 — %4").arg(example.objectName, example.objectId, raw, example.reason);
+            if (request.targetType == QStringLiteral("select") && (field.fieldType == QStringLiteral("text") || field.fieldType == QStringLiteral("long_text")) && example.value.isString()) {
+                auto *replacement = new QComboBox(mappings);
+                replacement->setObjectName(QStringLiteral("selectReplacementChoice"));
+                replacement->setProperty("migrationSourceValue", example.value.toString());
+                replacement->addItem(QStringLiteral("Replace “%1” with…").arg(example.value.toString()), QString());
+                for (const QJsonValue &choice : request.targetOptions.value(QStringLiteral("choices")).toArray()) replacement->addItem(choice.toString(), choice.toString());
+                mappingLayout->addWidget(replacement);
+                connect(replacement, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+            } else if ((request.targetType == QStringLiteral("reference") || request.targetType == QStringLiteral("references")) &&
+                       (field.fieldType == QStringLiteral("text") || field.fieldType == QStringLiteral("long_text") || field.fieldType == QStringLiteral("select")) && example.value.isString()) {
+                auto *replacement = new QComboBox(mappings);
+                replacement->setObjectName(QStringLiteral("referenceReplacementObject"));
+                replacement->setProperty("migrationSourceValue", example.value.toString());
+                replacement->addItem(QStringLiteral("Map “%1” to an object…").arg(example.value.toString()), QString());
+                const QString allowed = request.targetOptions.value(QStringLiteral("allowed_type_id")).toString();
+                for (const ObjectRecord &candidate : std::as_const(m_objects)) {
+                    if (!allowed.isEmpty() && candidate.typeId != allowed) continue;
+                    const auto candidateType = std::find_if(m_types.cbegin(), m_types.cend(), [&](const ObjectType &item) { return item.id == candidate.typeId; });
+                    replacement->addItem(QStringLiteral("%1 · %2").arg(candidate.name, candidateType == m_types.cend() ? candidate.typeId : candidateType->name), candidate.id);
+                }
+                mappingLayout->addWidget(replacement);
+                connect(replacement, &QComboBox::currentIndexChanged, &dialog, [invalidatePreview] { invalidatePreview(); });
+            }
+        }
+        previewText->setPlainText(lines.join(QLatin1Char('\n')));
+        previewToken = result.previewToken;
+        applyButton->setEnabled(result.canApply);
+        if (!result.canApply && result.incompatibleValues > 0)
+            previewText->append(QStringLiteral("Edit incompatible object values in their normal editor, or choose an explicit replacement above, then preview again."));
+    });
+    connect(applyButton, &QPushButton::clicked, &dialog, [&, requestForCurrentControls] {
+        if (previewToken.isEmpty()) return;
+        const FieldMigrationRequest request = requestForCurrentControls();
+        QString error;
+        FieldMigrationPreview result;
+        if (!m_repository.applyFieldTypeMigration(fieldId, request, previewToken, &result, &error)) {
+            applyButton->setEnabled(false);
+            previewToken.clear();
+            previewText->append(QStringLiteral("\nMigration was not applied: %1").arg(error));
+            return;
+        }
+        QMessageBox::information(&dialog, QStringLiteral("Field migration complete"),
+            QStringLiteral("%1 values converted across %2 objects. The migration and Object History events were saved atomically.").arg(result.savedValues).arg(result.affectedObjects));
+        dialog.accept();
+    });
     if (dialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
 }
 
@@ -2586,8 +3319,66 @@ void MainWindow::openProfile()
         boxLayout->addWidget(description);
         bodyLayout->addWidget(box);
     };
-    addSection(QStringLiteral("Account"), QStringLiteral("Username:  Local Player\nYour profile and game data are stored in the local SQLite database."), true);
-    addSection(QStringLiteral("Security"), QStringLiteral("Password changes and session revocation are not available in the native desktop milestone."));
+    addSection(QStringLiteral("Account"), QStringLiteral("Username:  %1\nYour account and game data are stored in the local SQLite database.").arg(m_repository.activeUsername()), true);
+    auto *securityBox = panel(QStringLiteral(""));
+    securityBox->setObjectName(QStringLiteral("settingsSection"));
+    securityBox->setStyleSheet(QStringLiteral("QFrame#settingsSection { background:#fffaf2; border:1px solid #d8c9b9; }"));
+    auto *securityLayout = new QVBoxLayout(securityBox);
+    securityLayout->setContentsMargins(11, 9, 11, 9);
+    securityLayout->setSpacing(5);
+    securityLayout->addWidget(textLabel(QStringLiteral("SECURITY")));
+    securityLayout->addWidget(textLabel(QStringLiteral("Passwords are stored as bcrypt hashes. This desktop session ends when you lock or switch accounts.")));
+    auto *changePassword = button(QStringLiteral("Change Password"), QStringLiteral("changePasswordButton"), securityBox);
+    auto *lockAccount = button(QStringLiteral("Lock / Switch Account"), QStringLiteral("lockAccountButton"), securityBox);
+    auto *importWebData = button(QStringLiteral("Import Existing Web Data"), QStringLiteral("importWebDataButton"), securityBox);
+    securityLayout->addWidget(changePassword, 0, Qt::AlignLeft);
+    securityLayout->addWidget(importWebData, 0, Qt::AlignLeft);
+    securityLayout->addWidget(lockAccount, 0, Qt::AlignLeft);
+    bodyLayout->addWidget(securityBox);
+    connect(changePassword, &QPushButton::clicked, &dialog, [this, &dialog] {
+        QDialog passwordDialog(&dialog);
+        passwordDialog.setWindowTitle(QStringLiteral("Change Password"));
+        auto *form = new QFormLayout(&passwordDialog);
+        auto *current = new QLineEdit(&passwordDialog);
+        current->setObjectName(QStringLiteral("currentPasswordInput"));
+        current->setEchoMode(QLineEdit::Password);
+        current->setMaxLength(72);
+        auto *next = new QLineEdit(&passwordDialog);
+        next->setObjectName(QStringLiteral("newPasswordInput"));
+        next->setEchoMode(QLineEdit::Password);
+        next->setMaxLength(72);
+        auto *confirm = new QLineEdit(&passwordDialog);
+        confirm->setObjectName(QStringLiteral("confirmPasswordInput"));
+        confirm->setEchoMode(QLineEdit::Password);
+        confirm->setMaxLength(72);
+        form->addRow(QStringLiteral("Current password"), current);
+        form->addRow(QStringLiteral("New password"), next);
+        form->addRow(QStringLiteral("Confirm new password"), confirm);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &passwordDialog);
+        form->addRow(buttons);
+        connect(buttons, &QDialogButtonBox::rejected, &passwordDialog, &QDialog::reject);
+        connect(buttons, &QDialogButtonBox::accepted, &passwordDialog, [&] {
+            if (next->text() != confirm->text()) {
+                QMessageBox::warning(&passwordDialog, QStringLiteral("Password mismatch"), QStringLiteral("The password confirmation does not match."));
+                return;
+            }
+            QString error;
+            if (!m_repository.changePassword(current->text(), next->text(), &error)) {
+                QMessageBox::warning(&passwordDialog, QStringLiteral("Could not change password"), error);
+                return;
+            }
+            passwordDialog.accept();
+        });
+        passwordDialog.exec();
+    });
+    connect(lockAccount, &QPushButton::clicked, &dialog, [this, &dialog] {
+        dialog.accept();
+        emit accountLockRequested();
+    });
+    connect(importWebData, &QPushButton::clicked, &dialog, [this, &dialog] {
+        WebImportDialog importDialog(m_repository, &dialog);
+        if (importDialog.exec() == QDialog::Accepted) refreshGames(m_selectedGameId);
+    });
     QString archiveError;
     const QVector<ArchivedEntry> archivedEntries = m_repository.archivedEntries(&archiveError);
     if (!archiveError.isEmpty()) {

@@ -1,39 +1,34 @@
-# Feature parity checklist
+# Feature parity status
 
-The current source tree was inspected statically. Its migrations directory contains 11 SQL files, through `011_object_gallery.sql`. The source checkout's `main` ref resolves to `0fb841bae13ea4390ed8a2e29b2bf8e9470d99ac`, matching the reference commit named in the supplied specification. The inspected DevHub and Something-Qt refs resolve to `c896d417a016f9b54689dbe702c5a17fb4b72678` and `cfee44d4cdb476b50be1f2a8b97d1800d8367a4d` respectively.
+Status reviewed against the source on 2026-11-07. **Stage 1 is implemented and verified for the native desktop application. Stage 2 was not started in this task.** The Web implementation remains the shared-behavior reference; the desktop application uses its own C++20, Qt Widgets, and SQLite runtime.
 
-“Started” means there is a native foundation or data representation, not a complete source-equivalent feature.
-
-| Area | Status | Current native behavior |
+| Feature area | Web (Go/JavaScript) | Desktop (C++/Qt) |
 |---|---|---|
-| C++20 / Qt 6 Widgets / CMake | Implemented | Native executable, CMake presets, Qt Creator-compatible project |
-| No web runtime | Implemented | No WebEngine, server, HTTP API, or Go dependency |
-| Retro theme and shell | Partial | Palette, pixel-style borders, sky strip, topbar, game rail, hero, tabs, section rail, empty states |
-| Game library | Partial | Local create/edit, search, select, active-game counts, archive from the editor, and restore from Profile & Settings. Create/edit now preserve personal notes and choose a cover from the owned image library; game database import/export remains absent |
-| Sections | Partial | Create root/nested sections, browse each section's placed objects, add or remove a shared object from active sections, archive from the tree context menu, and restore from settings. Section reordering, moving, goal placement, and the five configurable display modes remain |
-| SQLite source schema | Partial | Source migrations 001–011 embedded and applied transactionally; existing user database import/backup is absent |
-| Account/authentication | Not implemented | A local profile row is created; passwords, bcrypt compatibility, login, sessions, and password change are absent |
-| Profile archive recovery | Partial | Profile & Settings lists and restores archived games, sections, and objects, and opens the local image manager. Type/field archives and imported accounts are not available |
-| Object types and fields | Partial | Create types with fallback images and create fields with descriptions and validated typed defaults, including explicit `false` and zero. Effective defaults are returned for active fields. Type/field editing, archive/restore, option editing, primary display settings, and safe option migration remain |
-| Field migration wizard | Not implemented | Source migration SQL is present only |
-| Object CRUD and relationships | Partial | Create, edit, archive, restore, persist supported field values, and link objects in the same game. Objects can choose an owned image; cards show object art or the type fallback. Presets and rich gallery are absent |
-| Formula engine | Partial | Create a formula field with stable field-ID references, arithmetic, relationship aggregation (sum/avg/min/max/count), a live preview against an example object, dependency evaluation, and per-object error display. Formula option editing, formula-backed goal rules, and preset effective values remain |
-| Goals and prerequisites | Partial | Create, edit, and delete four goal types, including basic numeric field targets. Same-game prerequisites have cycle checks and completion gates. Goals support title and description search, status and type filters, sorting, and 20 goals per page. Advanced rule-builder targets and section placement remain |
-| Recursive progress | Not implemented | No traversal service yet |
-| Object history and charts | Partial | Active and archived objects have a native timeline with old and new values, stable field IDs, event/field/UTC date filters, and 20 events per page. The numeric chart now loads a separate bounded set of the latest 100 matching field changes with the same date range, independent of timeline paging. The timeline can display recorded field-type migrations, but the desktop migration wizard, chart retry state, and background history loading remain |
-| Templates and presets | Not implemented | Source table definitions are present only |
-| Custom dashboard widgets | Partial | Overview shows recently edited objects and game statistics; widget configuration, persistence, and the other dashboard widgets are absent |
-| Gallery, comparison, graph | Not implemented | No native feature screens yet |
-| Image asset lifecycle | Partial | Local profile storage normalizes decoded images to PNG, uses generated UUID names under a private uploads directory, checks resolved paths, enforces 5 MB/6000 px/16 MP, and accounts for the 1000-file/250 MB quota. Owned-library selection, game/type/object references, archived-record protection, queued deletion, bounded cleanup, retry, and save failure handling are wired and covered. Login/import and galleries are absent |
-| Image formats | Partial | PNG, JPEG, GIF, and BMP are available in this build. WebP is available only when libwebp is linked; portable packaging requires libwebp |
-| Search, filters, sorting, pagination | Partial | Game name search, goal search/filter/sort and paging, history filters and paging, and object browsing by section. The goals page filters and sorts the complete loaded collection before building the visible cards. Repository-level object and goal paging remain |
-| Automated tests | Partial | Disposable Qt Test suites cover migration parsing, object and goal persistence, section placement, history pagination and filters, formula arithmetic/defaults/relationship aggregation/cycles, typed field defaults, and image validation, quota, ownership, archived references, failed cleanup/retry, and native image/default/formula editor flows. The broader source-equivalent matrix remains |
-| Portable packaging | Verified on this machine | The Release Make target produced a Windows x64 ZIP and SHA-256 file. An extracted copy passed the runtime check and rendered a native Windows preview with a system-only PATH. A separate clean-machine run remains |
+| Runtime | Go HTTP server, SQLite, browser ES modules | Standalone Qt Widgets and SQLite; no WebEngine or Go runtime |
+| Authentication | Account registration/login and browser session handling | Persistent local accounts, bcrypt registration/login, lock and switch, password change, last username only in QSettings, and access scoped to the signed-in account |
+| Legacy desktop profile | Not applicable | The original local profile is retained. A one-time explicit “Secure Existing Local Profile” action adds credentials while preserving its ID and owned records. |
+| Web data import | Source application | Imports a read-only, consistent schema-v11 database snapshot plus uploads. Preserves account IDs/hashes and stored records; see [data import](DATA_IMPORT.md). |
+| Object types | Create, edit, archive/restore and configure fields | Create and edit name, description, icon, fallback image, primary display field; archive and restore while preserving objects and stable IDs |
+| Custom fields | Supported web field vocabulary and validation | Create/edit supported field definitions, options, defaults, order, reference constraints, and formula expressions/aggregation; archive and restore with dependency checks |
+| Select option edits | Replacement-based value updates | Add/rename/remove choices with explicit replacement mapping for saved values and defaults; updates are transactional |
+| Field type migration | Web preview/apply and audit behavior | Native preview/apply flow with conversions, defaults, active and archived values, dependencies, representative examples, stale-preview detection, transaction rollback, audit rows, and Object History |
+| Formula evaluation | Formula language and relationship aggregation | Stable field-ID references, arithmetic, formula dependency checks, aggregation, preview, and error reporting; formula-to-numeric conversion freezes current results only after explicit confirmation |
+| Objects and relationships | Canonical game-owned objects and placements | Native object CRUD, same-game relationships, shared placements, archived values, and object history |
+| Goals | Goal types, field targets, dependencies and rules | Manual, checklist, numeric, and field-target goals with same-game prerequisites and cycle prevention. Advanced configurable rules and section goal placement remain outside Stage 1. |
+| Sections and views | Nested sections and five view modes | Nested sections, placements, browsing, archive and restore. Reordering/moving and the full configurable display modes remain Stage 2 work. |
+| Templates, presets, dashboards and gallery | Supported web workflows | Data tables are retained by import, but native template, preset, dashboard, and gallery authoring workflows remain incomplete. |
+| Search and collection navigation | Web behaviors | Game and goal search, goal filters/sort/paging, section object browsing, and history filters/paging. Full object filtering and repository-level pagination remain incomplete. |
+| Image storage | Web upload lifecycle | Desktop-owned image library with ownership, quota/path validation, archive-aware references and cleanup. Import carries uploaded assets and their references. |
+| Visual style | Retro pixel-art web UI | Native Qt controls follow the purple/indigo and cream palette, pixel borders, and stepped shadows. |
 
-No feature is marked complete solely because its source database table exists.
+## Stage 1 implementation and verification
 
-## Next implementation steps
+- Native registration, authentication, account isolation, password change, local lock/switch, and legacy-profile securing use bcrypt. Go-created `$2a$10$` hashes authenticate in the desktop app; a native-created hash was accepted by Go's bcrypt verifier.
+- The importer requires a contiguous Web migration history through version 11 and its required tables. It reads through a read-only SQLite transaction, including active WAL state, checks integrity and foreign keys, stages assets with safe filenames and SHA-256 checks, and commits database rows only after validation. Conflicts stop the import without replacing existing records.
+- Type and field edits preserve IDs. Archive/restore preserves objects, values, and links. Primary display fields must be active fields on their own type. Select removals require replacements for values and defaults.
+- Field migration tests cover supported conversion families, exact integer JSON preservation, archived values and formula results, reference relationship handling, dependency blockers, preview staleness, and rollback.
+- `cmake --build --preset windows-dev-debug --parallel 4` succeeded. `ctest --preset windows-dev-debug --output-on-failure` passed both native Qt test targets. `go test ./...` passed. `node --test web/js/tests/*.test.mjs` passed 24 tests.
 
-1. Implement bcrypt-backed account selection and consistent SQLite and asset import together, so imported rows remain owned by their original account. Exercise the importer with a disposable active-WAL fixture.
-2. Finish type and field editing/archive recovery, dependency-aware option changes, formula option editing, and formula use in goals and presets. Then port direct and recursive section progress and rule-based goals.
-3. Build the field migration, template, preset, dashboard, gallery, comparison, and relationship graph workflows against those services. Add worker-owned SQLite connections and verify large collections before final visual and clean-machine acceptance.
+## Remaining desktop parity work
+
+Stage 1 is complete. Continue with Stage 2 only when requested. Later stages still need the remaining section views, complete search/filter/sort/pagination, recursive progress, template and preset workflows, configurable dashboards, gallery/comparison/relationship graph screens, and the broader source-equivalent acceptance matrix. No claim is made that the whole desktop product has feature parity yet.

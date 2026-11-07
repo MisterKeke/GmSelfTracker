@@ -282,9 +282,9 @@ QMap<QString, QString> FormulaEvaluator::evaluate(const QVector<FieldDefinition>
             double aggregate = 0;
             for (const QString &targetId : object.references.value(relationshipId)) {
                 const auto target = objectById.constFind(targetId);
-                if (target == objectById.cend() || target->gameId != object.gameId) continue;
+                if (target == objectById.cend() || target->gameId != object.gameId || target->archived) continue;
                 const auto targetType = typeById.constFind(target->typeId);
-                if (targetType == typeById.cend()) continue;
+                if (targetType == typeById.cend() || targetType->archived) continue;
                 const QString allowedType = relation->options.value(QStringLiteral("allowed_type_id")).toString();
                 if (!allowedType.isEmpty() && target->typeId != allowedType) continue;
                 if (operation == QStringLiteral("count")) { ++count; continue; }

@@ -22,6 +22,9 @@ class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(GameRepository &repository, QWidget *parent = nullptr);
 
+signals:
+    void accountLockRequested();
+
 private:
     enum class Page { Overview, Objects, Goals, Types, Templates };
 
@@ -41,7 +44,10 @@ private:
     void openEditGame();
     void openCreateSection();
     void openCreateType();
+    void openEditType(const QString &typeId);
     void openCreateField(const QString &typeId);
+    void openEditField(const QString &typeId, const QString &fieldId);
+    void openFieldTypeMigration(const QString &typeId, const QString &fieldId);
     void openObjectEditor(const QString &objectId = {});
     void openGoalEditor(const QString &goalId = {});
     void openProfile();

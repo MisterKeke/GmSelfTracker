@@ -52,6 +52,8 @@ struct ObjectType {
     QString icon;
     QString image;
     QVector<FieldDefinition> fields;
+    QString primaryDisplayFieldId;
+    bool archived = false;
 };
 
 struct ObjectRecord {
@@ -66,6 +68,7 @@ struct ObjectRecord {
     QMap<QString, QString> formulaErrors;
     QMap<QString, QStringList> references;
     QStringList sectionIds;
+    bool archived = false;
 };
 
 struct GoalTask {

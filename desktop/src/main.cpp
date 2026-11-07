@@ -1,4 +1,5 @@
 #include "app/main_window.h"
+#include "app/account_dialog.h"
 #include "app/theme.h"
 #include "infrastructure/database/game_repository.h"
 #include "infrastructure/assets/image_decoder.h"
@@ -12,9 +13,11 @@
 #include <QSqlDatabase>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QTextStream>
 
 #include <algorithm>
+#include <functional>
 
 namespace {
 
@@ -266,7 +269,26 @@ int main(int argc, char *argv[])
         QMessageBox::critical(nullptr, QStringLiteral("Could not open local data"), error);
         return 2;
     }
-    gmst::MainWindow window(repository);
-    window.show();
+    gmst::AccountDialog signIn(repository);
+    if (signIn.exec() != QDialog::Accepted) return 0;
+    std::function<void()> showTracker;
+    showTracker = [&] {
+        auto *window = new gmst::MainWindow(repository);
+        QObject::connect(window, &gmst::MainWindow::accountLockRequested, &application, [&, window] {
+            window->hide();
+            QTimer::singleShot(0, &application, [&, window] {
+                gmst::AccountDialog accountDialog(repository);
+                if (accountDialog.exec() == QDialog::Accepted) {
+                    window->deleteLater();
+                    showTracker();
+                } else {
+                    window->deleteLater();
+                    application.quit();
+                }
+            });
+        });
+        window->show();
+    };
+    showTracker();
     return application.exec();
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(GmSelfTrackerQt VERSION 0.1.0 LANGUAGES CXX)
+project(GmSelfTrackerQt VERSION 0.1.0 LANGUAGES C CXX)
 
 include(CTest)
 include(GNUInstallDirs)
@@ -39,13 +39,26 @@ add_library(gmst_core STATIC
     src/domain/formula_evaluator.h
     src/infrastructure/database/migration_runner.cpp
     src/infrastructure/database/migration_runner.h
+    src/infrastructure/database/account_service.cpp
+    src/infrastructure/database/account_service.h
     src/infrastructure/database/game_repository.cpp
     src/infrastructure/database/game_repository.h
+    src/infrastructure/database/schema_management_service.cpp
+    src/infrastructure/database/schema_management_service.h
+    src/infrastructure/database/field_migration_service.cpp
+    src/infrastructure/database/field_migration_service.h
+    src/infrastructure/database/web_data_import_service.cpp
+    src/infrastructure/database/web_data_import_service.h
+    src/infrastructure/security/password_hasher.cpp
+    src/infrastructure/security/password_hasher.h
+    third_party/crypt_blowfish/crypt_blowfish.c
+    third_party/crypt_blowfish/crypt_blowfish.h
     src/infrastructure/assets/image_decoder.cpp
     src/infrastructure/assets/image_decoder.h
     resources/resources.qrc
 )
 target_include_directories(gmst_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(gmst_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/crypt_blowfish")
 target_link_libraries(gmst_core PUBLIC Qt6::Core Qt6::Gui Qt6::Sql)
 if(TARGET WebP::webp)
     target_link_libraries(gmst_core PUBLIC WebP::webp)
@@ -61,6 +74,10 @@ target_compile_definitions(gmst_core PUBLIC
 
 add_executable(GmSelfTrackerQt WIN32
     src/main.cpp
+    src/app/account_dialog.cpp
+    src/app/account_dialog.h
+    src/app/web_import_dialog.cpp
+    src/app/web_import_dialog.h
     src/app/main_window.cpp
     src/app/main_window.h
     src/app/theme.cpp
@@ -103,6 +120,10 @@ if(GMS_BUILD_TESTS)
 
     add_executable(gmst_ui_tests
         tests/ui_tests.cpp
+        src/app/account_dialog.cpp
+        src/app/account_dialog.h
+        src/app/web_import_dialog.cpp
+        src/app/web_import_dialog.h
         src/app/main_window.cpp
         src/app/main_window.h
         src/app/theme.cpp

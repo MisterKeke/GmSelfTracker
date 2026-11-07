@@ -1,6 +1,7 @@
 #include "infrastructure/database/game_repository.h"
 
 #include "infrastructure/database/migration_runner.h"
+#include "infrastructure/database/schema_management_service.h"
 #include "domain/formula_evaluator.h"
 #include "infrastructure/assets/image_decoder.h"
 
@@ -178,6 +179,71 @@ bool GameRepository::isOpen() const
     return m_database.isOpen();
 }
 
+bool GameRepository::registerAccount(const QString &username, const QString &password, QString *userId, QString *error)
+{
+    AccountRecord account;
+    if (!AccountService(m_database).registerAccount(username, password, &account, error)) return false;
+    m_userId = account.id;
+    m_activeUsername = account.username;
+    if (userId) *userId = account.id;
+    return true;
+}
+
+bool GameRepository::authenticate(const QString &username, const QString &password, QString *userId, QString *error)
+{
+    AccountRecord account;
+    if (!AccountService(m_database).authenticate(username, password, &account, error)) return false;
+    m_userId = account.id;
+    m_activeUsername = account.username;
+    if (userId) *userId = account.id;
+    return true;
+}
+
+bool GameRepository::secureLegacyProfile(const QString &username, const QString &password, QString *userId, QString *error)
+{
+    AccountRecord account;
+    if (!AccountService(m_database).secureLegacyProfile(username, password, &account, error)) return false;
+    m_userId = account.id;
+    m_activeUsername = account.username;
+    if (userId) *userId = account.id;
+    return true;
+}
+
+bool GameRepository::changePassword(const QString &currentPassword, const QString &newPassword, QString *error)
+{
+    return AccountService(m_database).changePassword(m_userId, currentPassword, newPassword, error);
+}
+
+bool GameRepository::legacyProfileAvailable() const
+{
+    return AccountService(m_database).legacyProfileAvailable();
+}
+
+bool GameRepository::setActiveAccount(const QString &userId, QString *error)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("SELECT username FROM users WHERE id=?"));
+    query.addBindValue(userId);
+    if (!query.exec() || !query.next()) {
+        if (error) *error = QStringLiteral("The selected account is unavailable.");
+        return false;
+    }
+    m_userId = userId;
+    m_activeUsername = query.value(0).toString();
+    return true;
+}
+
+QString GameRepository::activeUsername() const
+{
+    return m_activeUsername;
+}
+
+bool GameRepository::importWebData(const QString &sourceDatabasePath, const QString &sourceUploadsPath,
+                                   WebImportSummary *summary, QString *error)
+{
+    return WebDataImportService(m_database, m_path, m_assetRoot).import(sourceDatabasePath, sourceUploadsPath, summary, error);
+}
+
 bool GameRepository::ensureLocalProfile(QString *error)
 {
     QSqlQuery query(m_database);
@@ -241,23 +307,26 @@ QVector<Section> GameRepository::sections(const QString &gameId, QString *error)
     return result;
 }
 
-QVector<ObjectType> GameRepository::objectTypes(const QString &gameId, QString *error) const
+QVector<ObjectType> GameRepository::objectTypes(const QString &gameId, QString *error, bool includeArchived) const
 {
     QVector<ObjectType> result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image FROM object_types t "
+        "SELECT t.id,t.game_id,t.name,t.description,t.icon,t.image,t.primary_display_field_id,t.archived FROM object_types t "
         "JOIN games g ON g.id=t.game_id WHERE t.game_id=? AND g.user_id=? AND g.archived=0 "
-        "AND t.archived=0 ORDER BY t.sort_order,t.name COLLATE NOCASE"));
+        "AND (?=1 OR t.archived=0) ORDER BY t.sort_order,t.name COLLATE NOCASE"));
     query.addBindValue(gameId);
     query.addBindValue(m_userId);
+    query.addBindValue(includeArchived ? 1 : 0);
     if (!query.exec()) {
         if (error) *error = query.lastError().text();
         return result;
     }
     while (query.next()) {
         ObjectType type{query.value(0).toString(), query.value(1).toString(), query.value(2).toString(),
-            query.value(3).toString(), query.value(4).toString(), query.value(5).toString(), {}};
+            query.value(3).toString(), query.value(4).toString(), query.value(5).toString(), {}, {}, false};
+        type.primaryDisplayFieldId = query.value(6).toString();
+        type.archived = query.value(7).toInt() != 0;
         QSqlQuery fieldQuery(m_database);
         fieldQuery.prepare(QStringLiteral(
             "SELECT id,object_type_id,name,field_type,icon,description,default_json,options_json,sort_order,archived "
@@ -569,7 +638,16 @@ QVector<ArchivedEntry> GameRepository::archivedEntries(QString *error) const
         "UNION ALL "
         "SELECT o.id,'Object',g.name,o.name FROM objects o JOIN games g ON g.id=o.game_id "
         "WHERE g.user_id=? AND g.archived=0 AND o.archived=1 "
+        "UNION ALL "
+        "SELECT t.id,'Object Type',g.name,t.name FROM object_types t JOIN games g ON g.id=t.game_id "
+        "WHERE g.user_id=? AND g.archived=0 AND t.archived=1 "
+        "UNION ALL "
+        "SELECT f.id,'Field',g.name || ' / ' || t.name,f.name FROM field_definitions f "
+        "JOIN object_types t ON t.id=f.object_type_id JOIN games g ON g.id=t.game_id "
+        "WHERE g.user_id=? AND g.archived=0 AND t.archived=0 AND f.archived=1 "
         "ORDER BY 2,3 COLLATE NOCASE,4 COLLATE NOCASE"));
+    query.addBindValue(m_userId);
+    query.addBindValue(m_userId);
     query.addBindValue(m_userId);
     query.addBindValue(m_userId);
     query.addBindValue(m_userId);
@@ -1127,6 +1205,10 @@ bool GameRepository::restoreArchivedEntry(const ArchivedEntry &entry, QString *e
         }
         return true;
     }
+    if (entry.kind == QStringLiteral("Object Type"))
+        return setObjectTypeArchived(entry.id, false, error);
+    if (entry.kind == QStringLiteral("Field"))
+        return setFieldArchived(entry.id, false, error);
     if (entry.kind != QStringLiteral("Object")) {
         if (error) *error = QStringLiteral("This kind of archived item cannot be restored here.");
         return false;
@@ -1237,6 +1319,21 @@ bool GameRepository::createObjectType(const QString &gameId, const QString &name
     }
     if (createdId) *createdId = id;
     return true;
+}
+
+bool GameRepository::updateObjectType(const ObjectType &type, QString *error)
+{
+    return SchemaManagementService(m_database, m_userId).updateObjectType(type, error);
+}
+
+bool GameRepository::setObjectTypeArchived(const QString &typeId, bool archived, QString *error)
+{
+    return SchemaManagementService(m_database, m_userId).setObjectTypeArchived(typeId, archived, error);
+}
+
+bool GameRepository::setPrimaryDisplayField(const QString &typeId, const QString &fieldId, QString *error)
+{
+    return SchemaManagementService(m_database, m_userId).setPrimaryDisplayField(typeId, fieldId, error);
 }
 
 bool GameRepository::createField(const QString &typeId, const QString &name, const QString &fieldType,
@@ -1397,6 +1494,28 @@ bool GameRepository::createField(const QString &typeId, const QString &name, con
     }
     if (createdId) *createdId = id;
     return true;
+}
+
+bool GameRepository::updateField(const FieldDefinition &field, const QMap<QString, QString> &choiceReplacements, QString *error)
+{
+    return SchemaManagementService(m_database, m_userId).updateField(field, choiceReplacements, error);
+}
+
+bool GameRepository::setFieldArchived(const QString &fieldId, bool archived, QString *error)
+{
+    return SchemaManagementService(m_database, m_userId).setFieldArchived(fieldId, archived, error);
+}
+
+FieldMigrationPreview GameRepository::previewFieldTypeMigration(const QString &fieldId, const FieldMigrationRequest &request,
+                                                                QString *error) const
+{
+    return FieldMigrationService(m_database, m_userId).preview(fieldId, request, error);
+}
+
+bool GameRepository::applyFieldTypeMigration(const QString &fieldId, const FieldMigrationRequest &request,
+                                            const QString &previewToken, FieldMigrationPreview *result, QString *error)
+{
+    return FieldMigrationService(m_database, m_userId).apply(fieldId, request, previewToken, result, error);
 }
 
 bool GameRepository::saveObject(ObjectRecord &object, const QVector<FieldDefinition> &fields,

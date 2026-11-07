@@ -2,6 +2,9 @@
 
 #include "domain/game.h"
 #include "domain/object_history.h"
+#include "infrastructure/database/account_service.h"
+#include "infrastructure/database/field_migration_service.h"
+#include "infrastructure/database/web_data_import_service.h"
 
 #include <QSqlDatabase>
 #include <QImage>
@@ -19,9 +22,18 @@ public:
 
     bool open(QString *error = nullptr);
     bool isOpen() const;
+    bool registerAccount(const QString &username, const QString &password, QString *userId = nullptr, QString *error = nullptr);
+    bool authenticate(const QString &username, const QString &password, QString *userId = nullptr, QString *error = nullptr);
+    bool secureLegacyProfile(const QString &username, const QString &password, QString *userId = nullptr, QString *error = nullptr);
+    bool changePassword(const QString &currentPassword, const QString &newPassword, QString *error = nullptr);
+    bool legacyProfileAvailable() const;
+    bool setActiveAccount(const QString &userId, QString *error = nullptr);
+    QString activeUsername() const;
+    bool importWebData(const QString &sourceDatabasePath, const QString &sourceUploadsPath,
+                       WebImportSummary *summary = nullptr, QString *error = nullptr);
     QVector<Game> games(QString *error = nullptr) const;
     QVector<Section> sections(const QString &gameId, QString *error = nullptr) const;
-    QVector<ObjectType> objectTypes(const QString &gameId, QString *error = nullptr) const;
+    QVector<ObjectType> objectTypes(const QString &gameId, QString *error = nullptr, bool includeArchived = false) const;
     QVector<ObjectRecord> objects(const QString &gameId, QString *error = nullptr) const;
     QMap<QString, QString> historyFields(const QString &objectId, QString *error = nullptr) const;
     HistoryPage objectHistory(const QString &objectId, const HistoryFilter &filter, QString *error = nullptr) const;
@@ -36,9 +48,18 @@ public:
     bool createSection(const QString &gameId, const QString &parentId, const QString &name, const QString &icon, QString *error = nullptr);
     bool createObjectType(const QString &gameId, const QString &name, const QString &description,
                           const QString &icon, QString *createdId = nullptr, QString *error = nullptr, const QString &image = {});
+    bool updateObjectType(const ObjectType &type, QString *error = nullptr);
+    bool setObjectTypeArchived(const QString &typeId, bool archived, QString *error = nullptr);
+    bool setPrimaryDisplayField(const QString &typeId, const QString &fieldId, QString *error = nullptr);
     bool createField(const QString &typeId, const QString &name, const QString &fieldType,
                      const QString &icon, const QJsonObject &options, QString *createdId = nullptr, QString *error = nullptr,
                      const QString &description = {}, const QJsonValue &defaultValue = {});
+    bool updateField(const FieldDefinition &field, const QMap<QString, QString> &choiceReplacements = {}, QString *error = nullptr);
+    bool setFieldArchived(const QString &fieldId, bool archived, QString *error = nullptr);
+    FieldMigrationPreview previewFieldTypeMigration(const QString &fieldId, const FieldMigrationRequest &request,
+                                                    QString *error = nullptr) const;
+    bool applyFieldTypeMigration(const QString &fieldId, const FieldMigrationRequest &request, const QString &previewToken,
+                                 FieldMigrationPreview *result = nullptr, QString *error = nullptr);
     bool saveObject(ObjectRecord &object, const QVector<FieldDefinition> &fields,
                     const QString &sectionId = {}, QString *error = nullptr);
     bool archiveObject(const QString &objectId, QString *error = nullptr);
@@ -66,6 +87,7 @@ private:
     QString m_connectionName;
     QSqlDatabase m_database;
     QString m_userId = QStringLiteral("native-desktop-local");
+    QString m_activeUsername = QStringLiteral("Local Player");
 };
 
 } // namespace gmst

@@ -1,4 +1,5 @@
 #include "app/main_window.h"
+#include "app/account_dialog.h"
 #include "infrastructure/database/game_repository.h"
 
 #include <QFrame>
@@ -14,6 +15,7 @@
 #include <QProgressBar>
 #include <QTextEdit>
 #include <QTimer>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QTableWidget>
 #include <QTreeWidget>
@@ -25,6 +27,50 @@ class UiTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void accountDialogRegistersLogsInAndKeepsAccountsIsolated()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());
+        QCoreApplication::setOrganizationName(QStringLiteral("GmSelfTrackerUiTests"));
+        QCoreApplication::setApplicationName(QStringLiteral("AccountFlow"));
+        GameRepository repository(directory.filePath(QStringLiteral("accounts-ui.sqlite")));
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+
+        AccountDialog registration(repository);
+        registration.findChild<QLineEdit *>(QStringLiteral("accountUsername"))->setText(QStringLiteral("first_local"));
+        registration.findChild<QLineEdit *>(QStringLiteral("accountPassword"))->setText(QStringLiteral("first-password-123"));
+        registration.findChild<QLineEdit *>(QStringLiteral("accountConfirmPassword"))->setText(QStringLiteral("first-password-123"));
+        registration.findChild<QPushButton *>(QStringLiteral("accountRegisterButton"))->click();
+        QCOMPARE(registration.result(), static_cast<int>(QDialog::Accepted));
+        QCOMPARE(repository.activeUsername(), QStringLiteral("first_local"));
+        QString firstGame;
+        QVERIFY2(repository.createGame(QStringLiteral("First account game"), {}, {}, &firstGame, &error), qPrintable(error));
+
+        AccountDialog secondRegistration(repository);
+        secondRegistration.findChild<QLineEdit *>(QStringLiteral("accountUsername"))->setText(QStringLiteral("second_local"));
+        secondRegistration.findChild<QLineEdit *>(QStringLiteral("accountPassword"))->setText(QStringLiteral("second-password-456"));
+        secondRegistration.findChild<QLineEdit *>(QStringLiteral("accountConfirmPassword"))->setText(QStringLiteral("second-password-456"));
+        secondRegistration.findChild<QPushButton *>(QStringLiteral("accountRegisterButton"))->click();
+        QCOMPARE(secondRegistration.result(), static_cast<int>(QDialog::Accepted));
+        QVERIFY(repository.games(&error).isEmpty());
+
+        AccountDialog signIn(repository);
+        signIn.findChild<QLineEdit *>(QStringLiteral("accountUsername"))->setText(QStringLiteral("first_local"));
+        signIn.findChild<QLineEdit *>(QStringLiteral("accountPassword"))->setText(QStringLiteral("incorrect-password"));
+        signIn.findChild<QPushButton *>(QStringLiteral("accountLoginButton"))->click();
+        QCOMPARE(signIn.result(), 0);
+        QVERIFY(!signIn.findChild<QLabel *>(QStringLiteral("accountNotice"))->text().isEmpty());
+        signIn.findChild<QLineEdit *>(QStringLiteral("accountPassword"))->setText(QStringLiteral("first-password-123"));
+        signIn.findChild<QPushButton *>(QStringLiteral("accountLoginButton"))->click();
+        QCOMPARE(signIn.result(), static_cast<int>(QDialog::Accepted));
+        QCOMPARE(repository.activeUsername(), QStringLiteral("first_local"));
+        QCOMPARE(repository.games(&error).size(), 1);
+        QCOMPARE(repository.games(&error).first().id, firstGame);
+    }
+
     void goalFiltersRunBeforePagination()
     {
         QTemporaryDir directory;
@@ -163,11 +209,36 @@ private slots:
         QVERIFY(fieldSaved);
         QVERIFY(previewText.contains(QStringLiteral("14")));
         const auto after = repository.objectTypes(object.gameId);
-        bool created = false;
-        for (const FieldDefinition &field : after.first().fields) created = created || field.name == QStringLiteral("Double score");
-        QVERIFY(created);
+        const auto formulaField = std::find_if(after.first().fields.cbegin(), after.first().fields.cend(),
+            [](const FieldDefinition &field) { return field.name == QStringLiteral("Double score"); });
+        QVERIFY(formulaField != after.first().fields.cend());
         const auto objects = repository.objects(object.gameId);
-        QCOMPARE(objects.first().values.value(after.first().fields.last().id).toDouble(), 14.0);
+        QCOMPARE(objects.first().values.value(formulaField->id).toDouble(), 14.0);
+
+        QLabel *formulaLabel = nullptr;
+        for (QLabel *candidate : window.findChildren<QLabel *>(QStringLiteral("typeFieldRowTitle")))
+            if (candidate->property("fieldId").toString() == formulaField->id) formulaLabel = candidate;
+        QVERIFY(formulaLabel);
+        auto *editFormula = formulaLabel->parentWidget()->findChild<QPushButton *>(QStringLiteral("editFieldButton"));
+        QVERIFY(editFormula);
+        bool formulaEdited = false;
+        QTimer::singleShot(0, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto *expression = dialog->findChild<QTextEdit *>(QStringLiteral("fieldEditFormulaExpression"));
+            if (!expression) { dialog->reject(); return; }
+            expression->setPlainText(QStringLiteral("@{%1} * 3").arg(scoreId));
+            for (QPushButton *candidate : dialog->findChildren<QPushButton *>())
+                if (candidate->text() == QStringLiteral("Save Field")) { candidate->click(); formulaEdited = true; break; }
+        });
+        editFormula->click();
+        QVERIFY(formulaEdited);
+        const auto editedTypes = repository.objectTypes(object.gameId);
+        const auto editedFormula = std::find_if(editedTypes.first().fields.cbegin(), editedTypes.first().fields.cend(),
+            [&](const FieldDefinition &field) { return field.id == formulaField->id; });
+        QVERIFY(editedFormula != editedTypes.first().fields.cend());
+        QCOMPARE(editedFormula->options.value(QStringLiteral("expression")).toString(), QStringLiteral("@{%1} * 3").arg(scoreId));
+        QCOMPARE(repository.objects(object.gameId).first().values.value(formulaField->id).toDouble(), 21.0);
     }
 
     void gameEditorSelectsAnUploadedCoverAndKeepsPersonalNotes()
@@ -290,6 +361,135 @@ private slots:
         QCOMPARE(objects.size(), 1);
         QVERIFY(objects.first().values.contains(field.id));
         QCOMPARE(objects.first().values.value(field.id).toDouble(), 0.0);
+    }
+
+    void objectTypeAndFieldEditorsAreReachableAndPersistChanges()
+    {
+        QTemporaryDir directory;
+        GameRepository repository(directory.filePath(QStringLiteral("schema-ui.sqlite")));
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+        QString gameId;
+        QString typeId;
+        QString fieldId;
+        QVERIFY(repository.createGame(QStringLiteral("Schema UI"), {}, {}, &gameId, &error));
+        QVERIFY(repository.createObjectType(gameId, QStringLiteral("Entry"), {}, {}, &typeId, &error));
+        QVERIFY(repository.createField(typeId, QStringLiteral("Score"), QStringLiteral("integer"), {}, {}, &fieldId, &error));
+
+        MainWindow window(repository);
+        QPushButton *typesTab = nullptr;
+        for (QPushButton *candidate : window.findChildren<QPushButton *>(QStringLiteral("tabButton")))
+            if (candidate->text().contains(QStringLiteral("Types"))) { typesTab = candidate; break; }
+        QVERIFY(typesTab);
+        typesTab->click();
+        auto cards = window.findChildren<QFrame *>(QStringLiteral("typeCard"));
+        QCOMPARE(cards.size(), 1);
+        auto *primary = cards.first()->findChild<QComboBox *>(QStringLiteral("primaryDisplayFieldChoice"));
+        QVERIFY(primary);
+        QCOMPARE(primary->findData(fieldId) >= 0, true);
+        primary->setCurrentIndex(primary->findData(fieldId));
+        QPushButton *savePrimary = nullptr;
+        for (QPushButton *candidate : cards.first()->findChildren<QPushButton *>())
+            if (candidate->text() == QStringLiteral("Save")) { savePrimary = candidate; break; }
+        QVERIFY(savePrimary);
+        savePrimary->click();
+        QCOMPARE(repository.objectTypes(gameId).first().primaryDisplayFieldId, fieldId);
+        cards = window.findChildren<QFrame *>(QStringLiteral("typeCard"));
+
+        QPushButton *editType = nullptr;
+        for (QPushButton *candidate : cards.first()->findChildren<QPushButton *>())
+            if (candidate->text() == QStringLiteral("Edit Type")) { editType = candidate; break; }
+        QVERIFY(editType);
+        bool typeSaved = false;
+        QTimer::singleShot(0, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto *name = dialog->findChild<QLineEdit *>(QStringLiteral("typeNameInput"));
+            if (!name) { dialog->reject(); return; }
+            name->setText(QStringLiteral("Edited Entry"));
+            for (QPushButton *candidate : dialog->findChildren<QPushButton *>())
+                if (candidate->text() == QStringLiteral("Save Type")) { candidate->click(); typeSaved = true; break; }
+        });
+        editType->click();
+        QVERIFY(typeSaved);
+        QCOMPARE(repository.objectTypes(gameId).first().name, QStringLiteral("Edited Entry"));
+
+        cards = window.findChildren<QFrame *>(QStringLiteral("typeCard"));
+        QPushButton *editField = nullptr;
+        for (QPushButton *candidate : cards.first()->findChildren<QPushButton *>())
+            if (candidate->text() == QStringLiteral("Edit")) { editField = candidate; break; }
+        QVERIFY(editField);
+        bool fieldSaved = false;
+        QTimer::singleShot(0, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto *name = dialog->findChild<QLineEdit *>(QStringLiteral("fieldEditNameInput"));
+            if (!name) { dialog->reject(); return; }
+            name->setText(QStringLiteral("Power"));
+            for (QPushButton *candidate : dialog->findChildren<QPushButton *>())
+                if (candidate->text() == QStringLiteral("Save Field")) { candidate->click(); fieldSaved = true; break; }
+        });
+        editField->click();
+        QVERIFY(fieldSaved);
+        QCOMPARE(repository.objectTypes(gameId).first().fields.first().id, fieldId);
+        QCOMPARE(repository.objectTypes(gameId).first().fields.first().name, QStringLiteral("Power"));
+    }
+
+    void fieldTypeMigrationDialogPreviewsAndPersistsConversion()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        GameRepository repository(directory.filePath(QStringLiteral("migration-ui.sqlite")));
+        QString error;
+        QVERIFY2(repository.open(&error), qPrintable(error));
+        QString gameId;
+        QString typeId;
+        QString fieldId;
+        QVERIFY(repository.createGame(QStringLiteral("Migration UI"), {}, {}, &gameId, &error));
+        QVERIFY(repository.createObjectType(gameId, QStringLiteral("Entry"), {}, {}, &typeId, &error));
+        QVERIFY(repository.createField(typeId, QStringLiteral("Score text"), QStringLiteral("text"), {}, {}, &fieldId, &error));
+        ObjectRecord object;
+        object.gameId = gameId;
+        object.typeId = typeId;
+        object.name = QStringLiteral("Score record");
+        object.values.insert(fieldId, QStringLiteral("37"));
+        QVERIFY2(repository.saveObject(object, repository.objectTypes(gameId, &error).first().fields, {}, &error), qPrintable(error));
+
+        MainWindow window(repository);
+        for (QPushButton *candidate : window.findChildren<QPushButton *>(QStringLiteral("tabButton")))
+            if (candidate->text().contains(QStringLiteral("Types"))) candidate->click();
+        QPushButton *migrate = window.findChild<QPushButton *>(QStringLiteral("migrateFieldTypeButton"));
+        QVERIFY(migrate);
+        bool previewed = false;
+        bool applied = false;
+        QTimer::singleShot(0, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog || dialog->objectName() != QStringLiteral("fieldTypeMigrationDialog")) return;
+            auto *target = dialog->findChild<QComboBox *>(QStringLiteral("migrationTargetType"));
+            auto *previewButton = dialog->findChild<QPushButton *>(QStringLiteral("previewFieldMigrationButton"));
+            auto *applyButton = dialog->findChild<QPushButton *>(QStringLiteral("applyFieldMigrationButton"));
+            if (!target || !previewButton || !applyButton) { dialog->reject(); return; }
+            target->setCurrentIndex(target->findData(QStringLiteral("integer")));
+            previewButton->click();
+            previewed = applyButton->isEnabled();
+            if (previewed) {
+                QTimer::singleShot(0, [] {
+                    if (QWidget *modal = QApplication::activeModalWidget()) modal->close();
+                });
+                applyButton->click();
+                applied = true;
+            } else dialog->reject();
+        });
+        migrate->click();
+        QVERIFY(previewed);
+        QVERIFY(applied);
+        const auto updatedTypes = repository.objectTypes(gameId, &error);
+        const auto updatedField = std::find_if(updatedTypes.first().fields.cbegin(), updatedTypes.first().fields.cend(),
+            [&](const FieldDefinition &item) { return item.id == fieldId; });
+        QVERIFY(updatedField != updatedTypes.first().fields.cend());
+        QCOMPARE(updatedField->fieldType, QStringLiteral("integer"));
+        const auto migratedObjects = repository.objects(gameId, &error);
+        QCOMPARE(migratedObjects.first().values.value(fieldId).toDouble(), 37.0);
     }
 
     void selectedGameAndPrimaryActionAreRendered()
